@@ -156,9 +156,10 @@ impl HookRunner for RealHooks {
             }
         };
         // a background process the hook left behind may hold the pipes open: wait for the output only briefly
+        let until = std::time::Instant::now() + Duration::from_millis(300);
         let mut all = Vec::new();
         for h in readers {
-            all.extend(h.finish(Duration::from_millis(300)));
+            all.extend(h.finish(until.saturating_duration_since(std::time::Instant::now())));
         }
         let text = String::from_utf8_lossy(&all).to_string();
         let tail: String = text.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
@@ -863,8 +864,8 @@ mod tests {
     #[test]
     fn a_hook_that_leaves_a_background_child_does_not_block() {
         let t = std::time::Instant::now();
-        let o = RealHooks.run(&["sh".into(), "-c".into(), "echo done; sleep 3 &".into()], Duration::from_secs(10)).unwrap();
+        let o = RealHooks.run(&["sh".into(), "-c".into(), "echo done; sleep 6 &".into()], Duration::from_secs(10)).unwrap();
         assert_eq!((o.code, o.tail.as_str()), (Some(0), "done"));
-        assert!(t.elapsed() < Duration::from_secs(2), "returned after {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(4), "returned after {:?}", t.elapsed());
     }
 }

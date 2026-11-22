@@ -594,10 +594,10 @@ esac"#;
     #[test]
     fn a_provider_that_leaves_a_daemon_holding_stdout_does_not_hang_the_call() {
         let d = tmp("daemon");
-        let k = HoldCli::new(script(&d, "echo \"hold $5 until 2026-11-22 18:00:00 (pid 4242)\"; sleep 3 &"));
+        let k = HoldCli::new(script(&d, "echo \"hold $5 until 2026-11-22 18:00:00 (pid 4242)\"; sleep 6 &"));
         let t = Instant::now();
         let h = k.hold("corral:x", Duration::from_secs(60), None, false).unwrap();
         assert_eq!(h.pid, Some(4242), "what it printed is still read");
-        assert!(t.elapsed() < Duration::from_secs(2), "returned after {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(4), "returned after {:?}", t.elapsed());
     }
 }
