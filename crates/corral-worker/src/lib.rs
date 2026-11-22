@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod attempt;
 pub mod input;
+pub mod keepawake;
 pub mod link;
 pub mod lock;
 pub mod logs;
