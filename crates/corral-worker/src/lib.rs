@@ -1,14 +1,15 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! corral-worker: admission, runtime adapter, log publishing and the claim/run loop.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod admission;
+pub mod attempt;
+pub mod input;
+pub mod link;
+pub mod lock;
+pub mod logs;
+pub mod native;
+pub mod probe;
+pub mod run;
+pub mod runtime;
+pub mod settings;
+pub mod testing;
+pub mod worker;
