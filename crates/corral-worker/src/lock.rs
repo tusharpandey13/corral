@@ -69,7 +69,10 @@ pub enum Takeover {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LockStatus {
     Free,
-    Held { file: LockFile, stale: bool },
+    Held {
+        file: LockFile,
+        stale: bool,
+    },
     /// The file exists and does not parse.
     Unreadable,
 }

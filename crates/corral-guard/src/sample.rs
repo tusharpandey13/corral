@@ -249,10 +249,8 @@ pub fn read_power_supply(root: &Path) -> Result<Option<bool>, String> {
         let ty = std::fs::read_to_string(e.path().join("type")).unwrap_or_default();
         match ty.trim() {
             "Battery" => battery = true,
-            "Mains" | "USB" | "USB_C" | "USB_PD" => {
-                if std::fs::read_to_string(e.path().join("online")).map(|v| v.trim() == "1").unwrap_or(false) {
-                    mains_online = true;
-                }
+            "Mains" | "USB" | "USB_C" | "USB_PD" if std::fs::read_to_string(e.path().join("online")).is_ok_and(|v| v.trim() == "1") => {
+                mains_online = true;
             }
             _ => {}
         }

@@ -32,7 +32,7 @@ fn banned() -> Vec<String> {
         j(&["SIG", "TERM"]),
         j(&["SIG", "KILL"]),
         j(&["Command::new(\"", "kill\")"]),
-        j(&["Command::new(\"", "pkill\")"]),
+        j(&["Command::new(\"p", "kill\")"]),
     ]
 }
 
