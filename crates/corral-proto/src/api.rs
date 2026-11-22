@@ -26,6 +26,16 @@ pub struct GetReq {
     pub id: String,
 }
 
+/// `follow`: ask the scheduler to stream a job's logs, events and progress into the caller's own inbox space.
+/// `deliver` must start with the caller's inbox prefix (`_INBOX_<slug>.`); the scheduler creates three push
+/// consumers delivering to `<deliver>.log`, `<deliver>.ev` and `<deliver>.prog`. Followers never get JetStream
+/// consumer permissions themselves (PROTOCOL.md 12.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowReq {
+    pub id: String,
+    pub deliver: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ListReq {
     #[serde(default)]

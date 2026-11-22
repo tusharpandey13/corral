@@ -193,7 +193,7 @@ async fn put_artifacts(State(svc): State<S>, Path((id, attempt)): Path<(String, 
     if job.attempts != attempt || job.token.is_none() || job.token != t.lease {
         return status(StatusCode::FORBIDDEN, "the lease for this upload is no longer current");
     }
-    let cap = job.spec.artifacts_max_mb * 1024 * 1024;
+    let cap = job.spec.artifacts_max_mb.min(svc.settings.artifacts_cap_mb).saturating_mul(1024 * 1024);
     let refuse = |svc: &Service| {
         let _ = svc.db().set_artifacts_state(&id, "refused");
         svc.db().audit_write(svc.now(), "scheduler", "", Some(&id), "artifacts_refused", &format!("over {} MB", job.spec.artifacts_max_mb));

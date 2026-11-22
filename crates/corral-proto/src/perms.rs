@@ -4,7 +4,7 @@
 //! (R-SEC-01..03), so a missing subject here shows up as a failing flow.
 
 use crate::ident::Identity;
-use crate::subjects::{KV_WORKERS, STREAM_EVENTS, STREAM_LOGS};
+use crate::subjects::KV_WORKERS;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Perms {
@@ -12,18 +12,6 @@ pub struct Perms {
     pub subscribe: Vec<String>,
     /// Reply to requests received (the scheduler answers into callers' private inboxes).
     pub allow_responses: bool,
-}
-
-/// Consumer-management subjects a follower needs for ordered consumers on one stream.
-fn follower_js(stream: &str) -> Vec<String> {
-    vec![
-        format!("$JS.API.STREAM.INFO.{stream}"),
-        format!("$JS.API.CONSUMER.CREATE.{stream}"),
-        format!("$JS.API.CONSUMER.CREATE.{stream}.>"),
-        format!("$JS.API.CONSUMER.DELETE.{stream}.>"),
-        format!("$JS.API.CONSUMER.INFO.{stream}.>"),
-        format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.>"),
-    ]
 }
 
 pub fn for_identity(id: &Identity) -> Perms {
@@ -34,7 +22,7 @@ pub fn for_identity(id: &Identity) -> Perms {
             publish: ["corral.ctl.>", "corral.wake.>", "corral.event.>", "$JS.API.>", "$JS.ACK.>", "$JS.FC.>", "$KV.>"]
                 .map(String::from)
                 .to_vec(),
-            subscribe: vec!["corral.api.>".into(), "corral.work.>".into(), inbox, "$JS.API.>".into()],
+            subscribe: vec!["corral.api.>".into(), "corral.work.>".into(), "corral.progress.>".into(), inbox, "$JS.API.>".into()],
             allow_responses: true,
         },
         Identity::Worker(w) => Perms {
@@ -48,10 +36,11 @@ pub fn for_identity(id: &Identity) -> Perms {
             allow_responses: false,
         },
         Identity::Agent(_) | Identity::Owner => {
-            let mut publish = vec![format!("corral.api.{slug}.>"), "$JS.FC.>".to_string()];
-            publish.extend(follower_js(STREAM_LOGS));
-            publish.extend(follower_js(STREAM_EVENTS));
-            Perms { publish, subscribe: vec![inbox, "corral.event.>".into()], allow_responses: false }
+            // No JetStream API at all: a consumer an agent could create (a push consumer delivering a job's output to
+            // `corral.ctl.<w>`, or an edit of the scheduler's `sink` consumer) is a way to forge control messages
+            // and to stop log archiving. Followers ask the scheduler (`follow`), which creates consumers that
+            // deliver into the caller's own inbox space.
+            Perms { publish: vec![format!("corral.api.{slug}.>")], subscribe: vec![inbox, "corral.event.>".into()], allow_responses: false }
         }
     }
 }
@@ -99,6 +88,15 @@ mod tests {
         let a = for_identity(&Identity::Agent("laptop".into()));
         assert!(a.publish.contains(&"corral.api.agent-laptop.>".to_string()));
         assert!(!a.publish.iter().any(|s| s.starts_with("corral.work") || s.starts_with("corral.log")));
+        // R-SEC-02 (M1 review): no JetStream API (consumer create/delete/update, purge) for clients, and no flow
+        // control subjects either.
+        for who in [Identity::Agent("laptop".into()), Identity::Owner] {
+            let p = for_identity(&who);
+            assert_eq!(p.publish.len(), 1, "{who}: only its own corral.api.<slug>.>");
+            assert!(!p.publish.iter().any(|s| s.contains("$JS")), "{who}: {:?}", p.publish);
+        }
+        let wk = for_identity(&Identity::Worker("laptop".into()));
+        assert!(!wk.publish.iter().any(|s| s.contains("$JS.API")), "workers publish through their own subjects only");
         let o = for_identity(&Identity::Owner);
         assert!(o.publish.contains(&"corral.api.owner.>".to_string()));
         assert!(for_identity(&Identity::Scheduler).allow_responses);

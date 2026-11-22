@@ -47,6 +47,7 @@ impl SchedLink for Loopback {
     }
     async fn publish_log(&self, stream: &str, _job: &str, h: &LogHeaders, _p: Vec<u8>) -> Result<(), String> {
         self.logs.lock().unwrap().push((stream.to_string(), h.seq));
+        assert_eq!(h.stream, stream);
         Ok(())
     }
     async fn publish_progress(&self, _job: &str, _m: &ProgressMsg) {}
@@ -228,4 +229,59 @@ async fn memory_decline_keeps_the_job_queued_with_a_reason() {
     e.mem.set(12_000);
     e.worker.claim_notify.notify_one();
     e.until(&id, &[JobState::Succeeded]).await;
+}
+
+fn light_undeclared() -> JobSpec {
+    let mut s = JobSpec::simple(&["fake"]);
+    s.class = Class::Light;
+    s.ram_mb = None;
+    s
+}
+
+/// R-QUEUE-04 / R-ADM-02 / G1 (M1 review): a light job that declares no RAM is never unlimited: it is admitted
+/// against `light_ram_default` and killed `ram_exceeded` past that default times the slack.
+#[tokio::test]
+async fn light_job_without_ram_is_killed_past_the_default_budget() {
+    let e = env(|_| Behavior::Grow { footprint_mb: 2_000 });
+    let id = e.submit(&light_undeclared());
+    let j = e.until(&id, &[JobState::Killed]).await;
+    assert_eq!(j.reason.as_deref(), Some("ram_exceeded"));
+}
+
+#[tokio::test]
+async fn light_job_without_ram_is_admitted_against_the_default() {
+    let e = env(|_| Behavior::Exit { code: 0, after_ms: 10, stdout: String::new() });
+    e.mem.set(1_200); // 1200 - 512 (default) = 688 MB left, below the 1000 MB admit floor
+    let id = e.submit(&light_undeclared());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let j = e.job(&id);
+    assert_eq!((j.state, j.attempts), (JobState::Queued, 0), "a zero reservation would have admitted it");
+    assert!(j.waiting.iter().any(|w| w.text.contains("memory")), "{:?}", j.waiting);
+    e.mem.set(12_000);
+    e.worker.claim_notify.notify_one();
+    e.until(&id, &[JobState::Succeeded]).await;
+}
+
+/// R-EXEC-01 (M1 review test gap): a job that ignores TERM is KILLed after `kill_grace`, and only then.
+#[tokio::test]
+async fn term_ignoring_job_is_killed_after_the_grace() {
+    use corral_worker::runtime::UnitSignal;
+    let e = env(|_| Behavior::IgnoreTerm);
+    let mut s = heavy(100);
+    s.timeout_s = 1;
+    let id = e.submit(&s);
+    let j = e.until(&id, &[JobState::Killed]).await;
+    assert_eq!(j.reason.as_deref(), Some("timeout"));
+    let sigs = e.rt.signals.lock().unwrap().clone();
+    assert_eq!(sigs, vec![UnitSignal::Term, UnitSignal::Kill], "TERM first, KILL once after the grace");
+}
+
+/// G1 / R-QUEUE-04 (M1 review): a footprint that cannot be measured (process table unreadable) is not "zero": the
+/// job is stopped `ram_exceeded` after a few samples instead of running unwatched.
+#[tokio::test]
+async fn unmeasurable_footprint_fails_closed() {
+    let e = env(|_| Behavior::Unmeasurable);
+    let id = e.submit(&heavy(100));
+    let j = e.until(&id, &[JobState::Killed]).await;
+    assert_eq!(j.reason.as_deref(), Some("ram_exceeded"));
 }

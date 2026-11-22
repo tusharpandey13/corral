@@ -383,14 +383,23 @@ pub struct SubmitOutcome {
     pub effects: Vec<Effect>,
 }
 
+/// The note written into an archived log where chunks `last+1 .. seq` never arrived.
+pub fn sink_gap_note(last: u64, seq: u64) -> Vec<u8> {
+    format!("\n[corral] log chunks {}..{} are missing (never arrived)\n", last + 1, seq - 1).into_bytes()
+}
+
 pub enum SinkDecision {
     /// Write the chunk at this byte offset, then call `sink_commit`.
     Write {
         offset: u64,
     },
     Duplicate,
-    /// A gap: redeliver later.
-    Hold,
+    /// A gap: redeliver later. `last` is the last sequence written and `offset` the file size, so the caller can
+    /// give up after a while and record the gap (`sink_gap_note`).
+    Hold {
+        last: u64,
+        offset: u64,
+    },
     Drop,
 }
 
@@ -712,13 +721,20 @@ impl Store {
 
     // ---- heartbeat ----
 
+    /// A valid heartbeat revives an orphaned attempt to where it was: `running` if it had started, else `claimed`
+    /// (so `started`/`declined` still work and the claim deadline still applies).
+    fn revive_event(j: &JobRow) -> Event {
+        if j.started_at.is_some() { Event::Heartbeat } else { Event::HeartbeatUnstarted }
+    }
+
     pub fn heartbeat(&mut self, worker: &str, id: &str, hb: &HbReq, now: i64, st: &Settings) -> Res<HbOutcome> {
         let tx = self.imm()?;
         let mut j = load(&tx, id)?.ok_or_else(|| ApiError::not_found(format!("no job {id}")))?;
         Self::check_token(&j, worker, &hb.lease_token)?;
         let mut fx = Vec::new();
         if j.state == JobState::Orphaned {
-            transition(&tx, &mut j, Event::Heartbeat, now, &mut fx)?;
+            let ev = Self::revive_event(&j);
+            transition(&tx, &mut j, ev, now, &mut fx)?;
             j.orphaned_at = None;
         }
         j.lease_until = Some(now + st.lease_ttl_ms);
@@ -753,7 +769,8 @@ impl Store {
         let mut fx = Vec::new();
         if j.state == JobState::Orphaned && !matches!(ev, AttemptEvent::Note { .. }) {
             // The worker is back and reporting with the current token: that is a valid heartbeat.
-            transition(&tx, &mut j, Event::Heartbeat, now, &mut fx)?;
+            let ev = Self::revive_event(&j);
+            transition(&tx, &mut j, ev, now, &mut fx)?;
             j.orphaned_at = None;
             j.lease_until = Some(now + st.lease_ttl_ms);
         }
@@ -769,15 +786,9 @@ impl Store {
                 save(&tx, &j)?;
             }
             AttemptEvent::Declined { reasons } => {
-                transition(&tx, &mut j, Event::Declined, now, &mut fx)?;
-                Self::end_attempt(&tx, &j, "declined", None, None, now)?;
-                j.attempts = j.attempts.saturating_sub(1); // R-ADM-03: a decline never counts as an attempt
                 j.last_decline =
                     Some(serde_json::to_string(&serde_json::json!({ "worker": worker, "t": now, "reasons": reasons })).expect("json"));
-                j.worker = None;
-                j.token = None;
-                j.lease_until = None;
-                j.claimed_at = None;
+                Self::decline_locked(&tx, &mut j, None, now, &mut fx)?;
                 audit(&tx, now, &format!("worker:{worker}"), "", Some(id), "declined", &decline_text(&reasons));
                 save(&tx, &j)?;
             }
@@ -787,6 +798,23 @@ impl Store {
         }
         tx.commit()?;
         Ok(fx)
+    }
+
+    /// An attempt that never started goes back to the queue as a decline (R-ADM-03: not counted as an attempt), or
+    /// ends `cancelled` when a cancel was requested meanwhile (a cancelled job is never requeued). `j.last_decline`
+    /// is set by the caller. Works from `claimed` and (claim deadline passed while silent) from `orphaned`.
+    fn decline_locked(tx: &Connection, j: &mut JobRow, reason: Option<&str>, now: i64, fx: &mut Vec<Effect>) -> Res<()> {
+        let from_orphaned = j.state == JobState::Orphaned;
+        j.attempts = j.attempts.saturating_sub(1);
+        if j.cancel_requested {
+            j.reason = Some(REASON_CANCELLED.into());
+            transition(tx, j, Event::Cancel, now, fx)?;
+            return Self::end_attempt(tx, j, "cancelled", Some("cancelled"), None, now);
+        }
+        transition(tx, j, if from_orphaned { Event::GraceOverRequeue } else { Event::Declined }, now, fx)?;
+        Self::end_attempt(tx, j, "declined", reason, None, now)?;
+        Self::revoke(j);
+        Ok(())
     }
 
     fn end_attempt(tx: &Connection, j: &JobRow, outcome: &str, reason: Option<&str>, code: Option<i32>, now: i64) -> Res<()> {
@@ -825,13 +853,20 @@ impl Store {
             }
             "lost_local" => {
                 let retry = j.spec.retry_on_lost && j.attempts < j.spec.max_attempts;
-                j.reason = Some("lost_local".into());
-                Self::end_attempt(tx, j, "lost", Some("lost_local"), None, now)?;
-                if retry {
+                if j.cancel_requested {
+                    // A cancel that raced with the loss: the job must not come back.
+                    j.reason = Some(REASON_CANCELLED.into());
+                    Self::end_attempt(tx, j, "cancelled", Some("cancelled"), None, now)?;
+                    transition(tx, j, Event::Cancel, now, fx)?;
+                } else if retry {
+                    j.reason = Some("lost_local".into());
+                    Self::end_attempt(tx, j, "lost", Some("lost_local"), None, now)?;
                     transition(tx, j, Event::LostLocalRequeue, now, fx)?;
                     Self::revoke(j);
                     fx.push(Effect::Wake { job: j.id.clone() });
                 } else {
+                    j.reason = Some("lost_local".into());
+                    Self::end_attempt(tx, j, "lost", Some("lost_local"), None, now)?;
                     transition(tx, j, Event::LostLocalFinal, now, fx)?;
                 }
             }
@@ -916,19 +951,7 @@ impl Store {
                 }
                 JobState::Claimed => {
                     if j.claimed_at.is_some_and(|c| now - c >= st.claim_deadline_ms) {
-                        // The worker never started it: treat as a decline (not an attempt).
-                        transition(&tx, &mut j, Event::Declined, now, &mut fx)?;
-                        Self::end_attempt(&tx, &j, "declined", Some("claim_timeout"), None, now)?;
-                        j.attempts = j.attempts.saturating_sub(1);
-                        j.last_decline = Some(
-                            serde_json::to_string(&serde_json::json!({
-                                "worker": j.worker, "t": now, "reasons": [{"check": "claim", "reason": "claim_timeout"}]
-                            }))
-                            .expect("json"),
-                        );
-                        Self::revoke(&mut j);
-                        save(&tx, &j)?;
-                        fx.push(Effect::Wake { job: j.id.clone() });
+                        Self::claim_timeout(&tx, &mut j, now, &mut fx)?;
                     } else if j.lease_until.is_some_and(|l| now > l) {
                         Self::expire_lease(&tx, &mut j, now, &mut fx)?;
                     }
@@ -938,8 +961,14 @@ impl Store {
                 }
                 JobState::Orphaned => {
                     let since = j.orphaned_at.unwrap_or(now);
+                    let never_started_past_deadline =
+                        j.started_at.is_none() && j.claimed_at.is_some_and(|c| now - c >= st.claim_deadline_ms);
                     let silent_deadline = j.started_at.map(|s| s + (j.spec.timeout_s as i64) * 1000 + st.orphan_grace_ms);
-                    if silent_deadline.is_some_and(|d| now >= d) {
+                    if never_started_past_deadline {
+                        // The lease (90 s) runs out before the claim deadline (120 s), so a silent claim is seen
+                        // here: it is still a claim that was never acted on, not a lost attempt.
+                        Self::claim_timeout(&tx, &mut j, now, &mut fx)?;
+                    } else if silent_deadline.is_some_and(|d| now >= d) {
                         // R-EXEC-02: the worker is silent past timeout + orphan_grace.
                         j.reason = Some(KillReason::Timeout.as_str().into());
                         transition(&tx, &mut j, Event::Killed, now, &mut fx)?;
@@ -971,6 +1000,24 @@ impl Store {
         tx.execute("DELETE FROM requests WHERE t < ?1", [now - 600_000])?;
         tx.commit()?;
         Ok(fx)
+    }
+
+    /// The worker never started a claim within `claim_deadline`: treated as a decline with reason `claim_timeout`
+    /// (not an attempt), or as `cancelled` when a cancel was requested.
+    fn claim_timeout(tx: &Connection, j: &mut JobRow, now: i64, fx: &mut Vec<Effect>) -> Res<()> {
+        j.last_decline = Some(
+            serde_json::to_string(&serde_json::json!({
+                "worker": j.worker, "t": now, "reasons": [{"check": "claim", "reason": "claim_timeout"}]
+            }))
+            .expect("json"),
+        );
+        let cancelled = j.cancel_requested;
+        Self::decline_locked(tx, j, Some("claim_timeout"), now, fx)?;
+        save(tx, j)?;
+        if !cancelled {
+            fx.push(Effect::Wake { job: j.id.clone() });
+        }
+        Ok(())
     }
 
     fn expire_lease(tx: &Connection, j: &mut JobRow, now: i64, fx: &mut Vec<Effect>) -> Res<()> {
@@ -1008,20 +1055,31 @@ impl Store {
 
     // ---- progress ----
 
-    pub fn set_progress(&mut self, id: &str, pct: u8) -> Res<()> {
-        self.conn.execute("UPDATE jobs SET progress=?2 WHERE id=?1", params![id, pct as i64])?;
+    /// Only the worker that holds the job's live attempt may set its progress.
+    pub fn set_progress(&mut self, id: &str, worker: &str, pct: u8) -> Res<()> {
+        self.conn.execute(
+            "UPDATE jobs SET progress=?3 WHERE id=?1 AND worker=?2 AND state IN ('claimed','running','orphaned')",
+            params![id, worker, pct as i64],
+        )?;
         Ok(())
+    }
+
+    /// Drop audit rows older than `before` (the `events` table otherwise grows for ever).
+    pub fn prune_audit(&mut self, before: i64) -> Res<usize> {
+        Ok(self.conn.execute("DELETE FROM events WHERE t < ?1", [before])?)
     }
 
     // ---- log sink (R-IO-03, U-25) ----
 
-    pub fn sink_decide(&mut self, id: &str, attempt: u32, stream: &str, seq: u64, lease: &str) -> Res<SinkDecision> {
+    pub fn sink_decide(&mut self, id: &str, attempt: u32, stream: &str, seq: u64, worker: &str) -> Res<SinkDecision> {
         let j = match load(&self.conn, id)? {
             Some(j) => j,
             None => return Ok(SinkDecision::Drop),
         };
-        // Token mismatch (a revoked attempt, a forged header): discard.
-        if j.token.as_deref() != Some(lease) || j.attempts != attempt {
+        // Only the worker that holds the attempt may append, and only to the attempt's own files: a revoked attempt
+        // (requeued, or another worker's) is discarded. The worker comes from the log subject, which a worker can
+        // only publish under its own name (R-SEC-02); no secret travels in the log headers.
+        if j.worker.as_deref() != Some(worker) || j.attempts != attempt {
             return Ok(SinkDecision::Drop);
         }
         let (last, bytes): (u64, u64) = self
@@ -1038,7 +1096,7 @@ impl Store {
         } else if seq <= last {
             SinkDecision::Duplicate
         } else {
-            SinkDecision::Hold
+            SinkDecision::Hold { last, offset: bytes }
         })
     }
 

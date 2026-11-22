@@ -592,8 +592,11 @@ fn claim_that_is_never_started_times_out_as_a_decline() {
     let r = rig();
     let id = r.submit(&heavy(10));
     r.claim("w", &r.claim_req(&[], 1, 1000));
-    r.clock.advance_s(121);
-    r.tick();
+    // Tick once per second like the real loop: the 90 s lease runs out before the 120 s claim deadline.
+    for _ in 0..121 {
+        r.clock.advance_s(1);
+        r.tick();
+    }
     let j = r.get(&id);
     assert_eq!((j.state, j.attempts), (JobState::Queued, 0));
     assert!(j.waiting.iter().any(|w| w.text.contains("claim_timeout")), "{:?}", j.waiting);
@@ -733,21 +736,33 @@ fn waiting_text_is_per_worker() {
 
 // ---- U-25: log sink decisions ----
 
+/// R-IO-03 (M1 review): the note for a permanent gap names the missing chunk range.
 #[test]
-fn sink_accepts_only_the_next_seq_with_the_current_token() {
+fn gap_note_names_the_missing_range() {
+    let n = String::from_utf8(crate::store::sink_gap_note(4, 9)).unwrap();
+    assert!(n.contains("5..8"), "{n}");
+}
+
+#[test]
+fn sink_accepts_only_the_next_seq_from_the_attempts_worker() {
     use crate::store::SinkDecision::*;
     let r = rig();
     let id = r.submit(&heavy(10));
     let t = r.run_job("w", &[], &id);
     let mut st = r.svc.db();
-    assert!(matches!(st.sink_decide(&id, 1, "out", 1, &t).unwrap(), Write { offset: 0 }));
-    assert!(matches!(st.sink_decide(&id, 1, "out", 2, &t).unwrap(), Hold), "out of order is held");
+    let _ = t;
+    assert!(matches!(st.sink_decide(&id, 1, "out", 1, "w").unwrap(), Write { offset: 0 }));
+    assert!(matches!(st.sink_decide(&id, 1, "out", 3, "w").unwrap(), Hold { last: 0, offset: 0 }), "a gap is held");
     st.sink_commit(&id, 1, "out", 1, 100).unwrap();
-    assert!(matches!(st.sink_decide(&id, 1, "out", 1, &t).unwrap(), Duplicate), "redelivery is idempotent");
-    assert!(matches!(st.sink_decide(&id, 1, "out", 2, &t).unwrap(), Write { offset: 100 }));
-    assert!(matches!(st.sink_decide(&id, 1, "err", 1, &t).unwrap(), Write { offset: 0 }), "streams are independent");
-    assert!(matches!(st.sink_decide(&id, 1, "out", 2, "wrong-token").unwrap(), Drop), "R-QUEUE-06: stale token dropped");
-    assert!(matches!(st.sink_decide(&id, 2, "out", 1, &t).unwrap(), Drop), "wrong attempt dropped");
+    assert!(matches!(st.sink_decide(&id, 1, "out", 1, "w").unwrap(), Duplicate), "redelivery is idempotent");
+    assert!(matches!(st.sink_decide(&id, 1, "out", 2, "w").unwrap(), Write { offset: 100 }));
+    assert!(matches!(st.sink_decide(&id, 1, "out", 4, "w").unwrap(), Hold { last: 1, offset: 100 }));
+    assert!(matches!(st.sink_decide(&id, 1, "err", 1, "w").unwrap(), Write { offset: 0 }), "streams are independent");
+    assert!(
+        matches!(st.sink_decide(&id, 1, "out", 2, "other-worker").unwrap(), Drop),
+        "R-QUEUE-06 / R-SEC-02: another worker's chunks for this job are dropped"
+    );
+    assert!(matches!(st.sink_decide(&id, 2, "out", 1, "w").unwrap(), Drop), "wrong attempt dropped");
 }
 
 // ---- R-IO-05 retention ----
@@ -856,4 +871,42 @@ fn heartbeats_keep_a_slow_claim_alive() {
     }
     let j = r.get(&id);
     assert_eq!((j.state, j.attempts), (JobState::Claimed, 1), "four minutes of input fetching with heartbeats is not an abandoned claim");
+}
+
+// ---- M1 review minors ----
+
+/// Progress is accepted only from the worker that holds the job (R-SEC-02 / R-IO-06).
+#[test]
+fn progress_only_from_the_jobs_worker() {
+    let r = rig();
+    let id = r.submit(&heavy(10));
+    r.run_job("w", &[], &id);
+    r.svc.progress("intruder", &id, 99);
+    assert_eq!(r.get(&id).progress, None, "another worker cannot set progress");
+    r.svc.progress("w", &id, 40);
+    assert_eq!(r.get(&id).progress, Some(40));
+}
+
+/// R-IO-05: old audit rows are pruned with the retention run, recent ones stay.
+#[test]
+fn retention_prunes_the_audit_table() {
+    let r = rig_with(|s| s.retention_age_ms = 14 * 86_400_000);
+    r.submit(&heavy(10));
+    let before = r.svc.db().audit_count("api").unwrap();
+    assert!(before > 0);
+    r.clock.advance_s(15 * 86_400);
+    r.svc.db().audit_write(r.clock.now_ms(), "owner", "x", None, "api", "recent");
+    crate::gc::run(&r.svc, r.clock.now_ms()).unwrap();
+    assert_eq!(r.svc.db().audit_count("api").unwrap(), 1, "only the recent row is left");
+}
+
+/// R-IO-01 (M1 review): the artifact cap has a server-side maximum and cannot overflow.
+#[test]
+fn artifacts_cap_has_a_server_side_maximum() {
+    let r = rig();
+    let mut s = heavy(10);
+    s.artifacts_max_mb = u64::MAX;
+    let e = r.api::<_, SubmitReply>(&agent(), "submit", &s).unwrap_err();
+    assert_eq!(e.error, ErrorCode::BadRequest);
+    assert_eq!(e.extra["field"], "artifacts_max_mb");
 }

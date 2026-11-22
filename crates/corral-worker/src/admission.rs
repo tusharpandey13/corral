@@ -21,6 +21,9 @@ pub struct AdmitConfig {
 #[derive(Debug, Clone)]
 pub struct Need {
     pub id: String,
+    /// The attempt number: two attempts of one job (an old one still cleaning up, a new one claimed) never share a
+    /// slot, a reservation or a lock owner name.
+    pub attempt: u32,
     pub class: Class,
     pub ram_mb: u64,
     /// `auto` (the host's heavy lock), `none`, or a name (M1 has one lock per host).
@@ -30,7 +33,7 @@ pub struct Need {
 
 #[derive(Default)]
 struct State {
-    running: HashMap<String, Entry>,
+    running: HashMap<(String, u32), Entry>,
     paused: Option<String>,
     draining: bool,
 }
@@ -50,7 +53,7 @@ pub struct Admitter {
 
 /// Proof of admission. Dropping it frees the slot and releases the lock on every exit path.
 pub struct Ticket {
-    id: String,
+    key: (String, u32),
     agent: Option<String>,
     lock: Arc<dyn LockStore>,
     st: Arc<Mutex<State>>,
@@ -70,7 +73,7 @@ impl Drop for Ticket {
         if let Some(a) = &self.agent {
             self.lock.release(a);
         }
-        self.st.lock().unwrap_or_else(|e| e.into_inner()).running.remove(&self.id);
+        self.st.lock().unwrap_or_else(|e| e.into_inner()).running.remove(&self.key);
     }
 }
 
@@ -105,13 +108,14 @@ impl Admitter {
         self.st().draining
     }
     pub fn running_ids(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.st().running.keys().cloned().collect();
+        let mut v: Vec<String> = self.st().running.keys().map(|(id, _)| id.clone()).collect();
         v.sort();
+        v.dedup();
         v
     }
 
-    pub fn update_footprint(&self, id: &str, mb: u64) {
-        if let Some(e) = self.st().running.get_mut(id) {
+    pub fn update_footprint(&self, id: &str, attempt: u32, mb: u64) {
+        if let Some(e) = self.st().running.get_mut(&(id.to_string(), attempt)) {
             e.footprint_mb = mb;
         }
     }
@@ -206,7 +210,7 @@ impl Admitter {
             self.check(need, &st)?;
         }
         let wants_lock = need.class == Class::Heavy && need.lock != "none";
-        let agent = format!("corral:{}", need.id);
+        let agent = format!("corral:{}:{}", need.id, need.attempt);
         if wants_lock && let Err(busy) = self.lock.acquire(&agent, "corral job", need.pid, self.cfg.lock_ttl_s) {
             return Err(vec![reason("lock", busy.0)]);
         }
@@ -218,8 +222,9 @@ impl Admitter {
             }
             return Err(why);
         }
-        st.running.insert(need.id.clone(), Entry { class: need.class, ram_mb: need.ram_mb, footprint_mb: 0 });
-        Ok(Ticket { id: need.id.clone(), agent: wants_lock.then_some(agent), lock: self.lock.clone(), st: self.st.clone() })
+        let key = (need.id.clone(), need.attempt);
+        st.running.insert(key.clone(), Entry { class: need.class, ram_mb: need.ram_mb, footprint_mb: 0 });
+        Ok(Ticket { key, agent: wants_lock.then_some(agent), lock: self.lock.clone(), st: self.st.clone() })
     }
 
     /// Keep the host lock alive (`ttl / 3`) while the attempt runs (R-LOCK-03).
@@ -245,7 +250,7 @@ mod tests {
     }
 
     fn need(id: &str, ram: u64) -> Need {
-        Need { id: id.into(), class: Class::Heavy, ram_mb: ram, lock: "auto".into(), pid: 1 }
+        Need { id: id.into(), attempt: 1, class: Class::Heavy, ram_mb: ram, lock: "auto".into(), pid: 1 }
     }
 
     fn rig(mem: Arc<FakeMemory>) -> (Admitter, Arc<FakeLock>) {
@@ -285,12 +290,41 @@ mod tests {
         assert!(t.holds_lock());
         let e = a.try_start(&need("j-2", 1_000)).err().unwrap();
         assert!(e.iter().any(|r| r.check == "heavy_slot"));
-        let light = Need { id: "j-3".into(), class: Class::Light, ram_mb: 100, lock: "auto".into(), pid: 1 };
+        let light = Need { id: "j-3".into(), attempt: 1, class: Class::Light, ram_mb: 100, lock: "auto".into(), pid: 1 };
         let lt = a.try_start(&light).unwrap();
         assert!(!lt.holds_lock(), "light jobs take no host lock");
         drop(t);
         assert!(lock.is_free(), "dropping the ticket releases the lock");
         assert!(a.try_start(&need("j-2", 1_000)).is_ok());
+    }
+
+    /// R-SCHED-05 / R-ADM-01 (M1 review): two attempts of the same job id never share a slot or a reservation:
+    /// cleaning up the old attempt must not free what the new one holds.
+    #[test]
+    fn attempts_of_one_job_do_not_share_slots() {
+        let (a, _) = rig(FakeMemory::constant(10_000, 9_000));
+        let light = |attempt| Need { id: "j-1".into(), attempt, class: Class::Light, ram_mb: 100, lock: "auto".into(), pid: 1 };
+        let old = a.try_start(&light(1)).unwrap();
+        let new = a.try_start(&light(2)).unwrap();
+        assert_eq!(a.summary().0.light_free, 0, "both attempts hold a slot");
+        drop(old); // the stale attempt finishes its cleanup late
+        assert_eq!(a.summary().0.light_free, 1, "the new attempt still holds its slot");
+        assert_eq!(a.running_ids(), vec!["j-1".to_string()]);
+        a.update_footprint("j-1", 1, 999); // a late update from the old attempt touches nothing
+        drop(new);
+        assert!(a.running_ids().is_empty());
+    }
+
+    /// The host lock is owned per attempt: an old attempt's release cannot free the lock a new attempt holds.
+    #[test]
+    fn lock_owner_names_include_the_attempt() {
+        let (a, lock) = rig(FakeMemory::constant(10_000, 9_000));
+        let t = a.try_start(&Need { attempt: 2, ..need("j-1", 100) }).unwrap();
+        assert_eq!(t.lock_agent(), Some("corral:j-1:2"));
+        lock.release("corral:j-1:1"); // what the old attempt's teardown would do
+        assert!(!lock.is_free(), "the new attempt's lock survives the old attempt's release");
+        drop(t);
+        assert!(lock.is_free());
     }
 
     #[test]
@@ -315,7 +349,7 @@ mod tests {
         let (_, adm) = a2.summary();
         assert_eq!(adm.admissible_ram_mb, 8_000 - 5_000 - 2_000);
         assert!(a2.try_start(&Need { lock: "none".into(), ..need("j-2", 2_000) }).is_err());
-        a2.update_footprint("j-1", 5_000);
+        a2.update_footprint("j-1", 1, 5_000);
         assert_eq!(a2.summary().1.admissible_ram_mb, 8_000 - 2_000, "once used, MemAvailable already reflects it");
         drop(a);
     }

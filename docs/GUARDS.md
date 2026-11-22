@@ -183,7 +183,7 @@ changes. Exit code = the command's; 125 + one line on stderr when the guard kill
 - Directory mode 0700, file mode 0600.
 - **Acquire:** atomic create (`O_EXCL`). If it exists and is not stale → busy, with the holder description
   (`held by <agent> (<purpose>, apps [...], pid N), heartbeat 20s ago of ttl 300s`). A file that does not parse is
-  stale.
+  stale once it has not been modified for 10 s (a holder between `O_EXCL` create and the content write is live).
 - **Stale:** `now − heartbeat > ttl_s` (default 300 s).
 - **Takeover:** create `<lock>.takeover` with `O_EXCL`; re-read; if the holder is the same and still stale, delete the
   lock and append one JSON line `{"t", "event":"takeover", "by", "from"}` to `<lock>.log`; delete the takeover file;

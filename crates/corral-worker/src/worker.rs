@@ -16,6 +16,18 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+/// The live attempts, keyed by job and attempt number: an old attempt finishing its cleanup never removes the entry of
+/// the attempt that replaced it.
+#[derive(Default)]
+struct Registry(HashMap<(String, u32), Arc<AttemptFlags>>);
+
+impl Registry {
+    /// The attempt of `job` whose lease token is `token` (a control push must name the current lease).
+    fn find(&self, job: &str, token: &str) -> Option<&Arc<AttemptFlags>> {
+        self.0.iter().find(|((j, _), f)| j == job && f.token == token).map(|(_, f)| f)
+    }
+}
+
 pub struct Worker<L: SchedLink, R: Runtime> {
     pub link: Arc<L>,
     pub rt: Arc<R>,
@@ -23,7 +35,7 @@ pub struct Worker<L: SchedLink, R: Runtime> {
     pub st: Arc<WorkerSettings>,
     pub claim_notify: Notify,
     pub presence_notify: Notify,
-    attempts: Mutex<HashMap<String, Arc<AttemptFlags>>>,
+    attempts: Mutex<Registry>,
     last_decline: Mutex<Option<Instant>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -37,17 +49,17 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
             st,
             claim_notify: Notify::new(),
             presence_notify: Notify::new(),
-            attempts: Mutex::new(HashMap::new()),
+            attempts: Mutex::new(Registry::default()),
             last_decline: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
         })
     }
 
-    pub(crate) fn register(&self, id: &str, f: Arc<AttemptFlags>) {
-        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).insert(id.into(), f);
+    pub(crate) fn register(&self, id: &str, attempt: u32, f: Arc<AttemptFlags>) {
+        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).0.insert((id.into(), attempt), f);
     }
-    pub(crate) fn unregister(&self, id: &str) {
-        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    pub(crate) fn unregister(&self, id: &str, attempt: u32) {
+        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).0.remove(&(id.to_string(), attempt));
     }
     pub(crate) fn note_decline(&self) {
         *self.last_decline.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
@@ -62,6 +74,15 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
 
     pub fn running_jobs(&self) -> Vec<String> {
         self.adm.running_ids()
+    }
+
+    /// RAM the job is admitted and watched against: what it declared, else `light_ram_default` (a light job may omit
+    /// `ram_mb`, but it is never unlimited).
+    pub(crate) fn ram_for(&self, spec: &corral_proto::job::JobSpec) -> u64 {
+        match spec.ram() {
+            0 => self.st.light_ram_default_mb,
+            r => r,
+        }
     }
 
     fn claim_req(&self) -> ClaimReq {
@@ -108,8 +129,9 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
             let Some(job) = reply.job.clone() else { return };
             let need = Need {
                 id: job.id.clone(),
+                attempt: reply.attempt,
                 class: job.spec.class,
-                ram_mb: job.spec.ram(),
+                ram_mb: self.ram_for(&job.spec),
                 lock: job.spec.lock.clone(),
                 pid: std::process::id(),
             };
@@ -188,15 +210,15 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         match c.action.as_str() {
             "cancel" => {
                 if let (Some(job), Some(tok)) = (&c.job, &c.lease_token)
-                    && let Some(f) = self.attempts.lock().unwrap_or_else(|e| e.into_inner()).get(job)
-                    && &f.token == tok
+                    && let Some(f) = self.attempts.lock().unwrap_or_else(|e| e.into_inner()).find(job, tok)
                 {
                     f.cancel.store(true, Ordering::SeqCst);
                 }
             }
             "kill_stale" => {
-                if let Some(job) = &c.job
-                    && let Some(f) = self.attempts.lock().unwrap_or_else(|e| e.into_inner()).get(job)
+                // Like `cancel`, it must name the lease it is about: nobody can stop a job by guessing its id.
+                if let (Some(job), Some(tok)) = (&c.job, &c.lease_token)
+                    && let Some(f) = self.attempts.lock().unwrap_or_else(|e| e.into_inner()).find(job, tok)
                 {
                     f.stale.store(true, Ordering::SeqCst);
                 }
@@ -212,9 +234,9 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         self.presence_notify.notify_one();
     }
 
-    /// After a restart: any attempt the previous worker process left behind is ours to finish. A live process
-    /// group whose pid and start time we recorded is killed (never two attempts), and the attempt is reported
-    /// `lost_local`; a pending `finished` is delivered as recorded.
+    /// After a restart: any attempt the previous worker process left behind is ours to finish. Whatever is still
+    /// running of it is killed (never two attempts), and the attempt is reported `lost_local`; a pending `finished`
+    /// is delivered as recorded.
     pub async fn recover(self: &Arc<Self>) {
         let runs = self.st.work_dir.join("runs");
         let Ok(jobs) = std::fs::read_dir(&runs) else { return };
@@ -228,10 +250,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
                 let finished = match state.finished.clone() {
                     Some(f) => f,
                     None => {
-                        let now_start = crate::probe::start_time_of(state.pid);
-                        if state.pid != 0 && !now_start.is_empty() && now_start == state.start {
-                            self.kill_recorded(&state);
-                        }
+                        self.kill_leftovers(&state).await;
                         corral_proto::api::Finished {
                             outcome: "lost_local".into(),
                             exit_code: None,
@@ -260,17 +279,36 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         }
     }
 
-    /// Signal a process group recorded by a previous run of this worker. Only called after the pid's start time
-    /// matched what we recorded, so pid reuse cannot make us signal a stranger.
-    fn kill_recorded(&self, s: &AttemptState) {
-        use rustix::process::{Pid, Signal, kill_process_group};
-        if let Some(g) = Pid::from_raw(s.pgid as i32) {
-            let _ = kill_process_group(g, Signal::TERM);
-            std::thread::sleep(Duration::from_millis(self.st.kill_grace_ms.min(2000)));
-            if crate::probe::start_time_of(s.pid) == s.start {
-                let _ = kill_process_group(g, Signal::KILL);
+    /// Stop everything a previous run of this worker left behind for this attempt, whether or not its leader is
+    /// still alive: the members of the recorded process group (started no earlier than the leader, so a stranger
+    /// that reused the number is never touched) and, on Linux, any process carrying the attempt's
+    /// `CORRAL_JOB_ID`/`CORRAL_ATTEMPT`. TERM first, then KILL for whatever is still the same process after the
+    /// grace period (never two attempts, R-QUEUE-06, IT-25).
+    async fn kill_leftovers(&self, s: &AttemptState) {
+        use crate::probe::{AttemptKey, PsTable, attempt_survivors};
+        use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+        let key = AttemptKey { job: &s.job, attempt: s.attempt, pgid: s.pgid, leader_start: &s.start };
+        let signal_all = |procs: &[crate::probe::Proc], sig: Signal| {
+            if procs.iter().any(|p| p.pgid == s.pgid)
+                && let Some(g) = Pid::from_raw(s.pgid as i32)
+            {
+                let _ = kill_process_group(g, sig);
             }
+            for p in procs.iter().filter(|p| p.pgid != s.pgid) {
+                if let Some(pid) = Pid::from_raw(p.pid as i32) {
+                    let _ = kill_process(pid, sig);
+                }
+            }
+        };
+        let first = attempt_survivors(&PsTable, &key);
+        if first.is_empty() {
+            return;
         }
+        signal_all(&first, Signal::TERM);
+        tokio::time::sleep(Duration::from_millis(self.st.kill_grace_ms.min(2000))).await;
+        let still: Vec<_> =
+            attempt_survivors(&PsTable, &key).into_iter().filter(|p| first.iter().any(|f| f.pid == p.pid && f.start == p.start)).collect();
+        signal_all(&still, Signal::KILL);
     }
 
     /// Remove finished runs older than `keep_failed_runs`.
@@ -303,5 +341,25 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         let mut t = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         t.push(tokio::spawn(self.clone().claim_loop()));
         t.push(tokio::spawn(self.clone().presence_loop()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R-QUEUE-06 (M1 review): the registry keeps attempts of one job apart, and a control push must name the
+    /// current lease token (`kill_stale` included).
+    #[test]
+    fn registry_is_per_attempt_and_token_checked() {
+        let mut r = Registry::default();
+        let (old, new) = (Arc::new(AttemptFlags::new("tok-1")), Arc::new(AttemptFlags::new("tok-2")));
+        r.0.insert(("j-1".into(), 1), old);
+        r.0.insert(("j-1".into(), 2), new.clone());
+        assert!(r.find("j-1", "tok-2").is_some_and(|f| Arc::ptr_eq(f, &new)));
+        assert!(r.find("j-1", "guess").is_none(), "a wrong token finds nothing");
+        assert!(r.find("j-2", "tok-2").is_none());
+        r.0.remove(&("j-1".to_string(), 1)); // the old attempt cleans up late
+        assert!(r.find("j-1", "tok-2").is_some(), "the new attempt is still registered");
     }
 }

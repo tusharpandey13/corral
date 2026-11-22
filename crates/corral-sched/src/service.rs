@@ -27,6 +27,8 @@ pub enum Out {
     Core { subject: String, payload: Vec<u8> },
     /// JetStream publish (stream captures the subject).
     Js { subject: String, payload: Vec<u8> },
+    /// Create the push consumers that stream one job to a follower (the NATS layer does it; followers cannot).
+    Follow { job: String, deliver: String },
 }
 
 #[derive(Default, Debug, Clone)]
@@ -245,6 +247,22 @@ impl Service {
                 encode_reply(&ListReply { jobs })
             }
             "workers" => self.workers(now)?,
+            "follow" => {
+                let r: FollowReq = body(value)?;
+                let prefix = format!("{}.", from.inbox_prefix());
+                let ok_chars = r.deliver.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                if !r.deliver.starts_with(&prefix)
+                    || r.deliver.len() > 120
+                    || !ok_chars
+                    || r.deliver.ends_with('.')
+                    || r.deliver.contains("..")
+                {
+                    return Err(ApiError::bad(format!("deliver must be a plain subject under {prefix}")).with("field", json!("deliver")));
+                }
+                self.db().get(&r.id).map_err(ApiError::from)?.ok_or_else(|| ApiError::not_found(format!("no job {}", r.id)))?;
+                self.send(Out::Follow { job: r.id, deliver: r.deliver });
+                encode_reply(&json!({ "ok": true }))
+            }
             "cancel" => self.cancel(from, env, value, now)?,
             "resubmit" => self.resubmit(from, env, value, now)?,
             "artifacts" => self.artifacts(from, value, now)?,
@@ -289,6 +307,9 @@ impl Service {
         }
         if spec.class == Class::Heavy && spec.ram_mb.is_none_or(|r| r == 0) {
             return Err(field("ram_mb", "heavy jobs must declare ram_mb (there is no silent default)"));
+        }
+        if spec.artifacts_max_mb > st.artifacts_cap_mb {
+            return Err(field("artifacts_max_mb", &format!("artifacts_max_mb is at most {}", st.artifacts_cap_mb)));
         }
         if spec.priority > 100 {
             return Err(field("priority", "priority is 0-100"));
@@ -616,8 +637,8 @@ impl Service {
     }
 
     /// Record a progress message (R-IO-06) for `status`.
-    pub fn progress(&self, job: &str, pct: u8) {
-        let _ = self.db().set_progress(job, pct);
+    pub fn progress(&self, worker: &str, job: &str, pct: u8) {
+        let _ = self.db().set_progress(job, worker, pct);
     }
 
     // ---- paths ----
