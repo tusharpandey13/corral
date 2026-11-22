@@ -187,3 +187,56 @@ async fn the_worker_socket_client_talks_to_a_real_guard() {
     let _ = rig.guard.handle(&json!({ "v": 1, "op": "unregister", "id": reg_id }));
     server.abort();
 }
+
+fn fake_proc(pid: u32, cmd: &str) -> corral_guard::procs::ProcInfo {
+    corral_guard::procs::ProcInfo {
+        pid,
+        ppid: 1,
+        pgid: pid,
+        rss_kb: 1024,
+        user: "u".into(),
+        start: "Mon Nov 22 10:00:00 2026".into(),
+        cmdline: cmd.into(),
+    }
+}
+
+const PAUSABLE: &str = "[[guard.matchers]]\nname = \"jobs\"\nselect = { cmdline = 'wk-job$' }\ntier = 0\npausable = true\n";
+
+/// H1 / SPEC 17.3 note 43: a paused unit that is missing from one sample (a matcher miss, a `ps` hiccup) is forgotten
+/// by the engine but still continued, and a unit that merely reappears is not left stopped.
+#[test]
+fn a_paused_unit_that_vanishes_from_one_sample_is_still_continued() {
+    use corral_guard::enforce::Sig;
+    let rig = Rig::enforcing_fake(PAUSABLE);
+    rig.sys.starts.lock().unwrap().insert(4242, "Mon Nov 22 10:00:00 2026".into());
+    *rig.procs.table.lock().unwrap() = vec![fake_proc(4242, "wk-job")];
+    rig.set_free_pct(21.0);
+    for _ in 0..3 {
+        rig.tick();
+    }
+    assert!(rig.sys.signals().contains(&("group".into(), 4242, Sig::Stop)), "paused: {:?}", rig.sys.signals());
+    rig.procs.table.lock().unwrap().clear(); // one sample without it
+    rig.tick();
+    assert!(rig.sys.signals().contains(&("group".into(), 4242, Sig::Cont)), "continued at once: {:?}", rig.sys.signals());
+    assert_eq!(std::fs::read_to_string(rig.guard.settings.state_dir.join("paused.json")).unwrap(), "[]");
+}
+
+/// H2 / note 43 at guard level: shutdown continues what is paused, and keeps what it could not check.
+#[test]
+fn shutdown_continues_paused_units_and_keeps_what_it_cannot_check() {
+    use corral_guard::enforce::Sig;
+    let rig = Rig::enforcing_fake(PAUSABLE);
+    rig.sys.starts.lock().unwrap().insert(4243, "Mon Nov 22 10:00:00 2026".into());
+    *rig.procs.table.lock().unwrap() = vec![fake_proc(4243, "wk-job")];
+    rig.set_free_pct(21.0);
+    for _ in 0..3 {
+        rig.tick();
+    }
+    rig.sys.set_fail(true);
+    rig.guard.shutdown();
+    assert!(!rig.sys.signals().contains(&("group".into(), 4243, Sig::Cont)), "no CONT on a guess");
+    assert!(std::fs::read_to_string(rig.guard.settings.state_dir.join("paused.json")).unwrap().contains("4243"), "kept");
+    rig.sys.set_fail(false);
+    rig.guard.shutdown();
+    assert!(rig.sys.signals().contains(&("group".into(), 4243, Sig::Cont)));
+}

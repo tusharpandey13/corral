@@ -125,6 +125,13 @@ pub fn run_cmd(prog: &str, args: &[&str], timeout: Duration) -> Result<String, S
 }
 
 pub fn run_cmd_owned(prog: &str, args: &[String], timeout: Duration) -> Result<String, String> {
+    let o = run_cmd_status(prog, args, timeout)?;
+    if o.status.success() { Ok(String::from_utf8_lossy(&o.stdout).to_string()) } else { Err(format!("{prog} exited with {}", o.status)) }
+}
+
+/// Like `run_cmd_owned` but hands back the whole output whatever the exit status (`ps -p` exits 1 for a missing pid).
+/// A command that does not finish within `timeout`, or cannot be started, is an `Err`.
+pub fn run_cmd_status(prog: &str, args: &[String], timeout: Duration) -> Result<std::process::Output, String> {
     if STUCK.load(Ordering::SeqCst) >= MAX_STUCK {
         return Err(format!("{prog}: {MAX_STUCK} earlier helper commands are stuck"));
     }
@@ -137,10 +144,9 @@ pub fn run_cmd_owned(prog: &str, args: &[String], timeout: Duration) -> Result<S
         let _ = tx.send(r);
     });
     match rx.recv_timeout(timeout) {
-        Ok(Ok(o)) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).to_string()),
-        Ok(Ok(o)) => Err(format!("{prog} exited with {}", o.status)),
+        Ok(Ok(o)) => Ok(o),
         Ok(Err(e)) => Err(format!("{prog}: {e}")),
-        Err(_) => Err(format!("{prog} timed out after {}s", timeout.as_secs())),
+        Err(_) => Err(format!("{prog} timed out after {} ms", timeout.as_millis())),
     }
 }
 

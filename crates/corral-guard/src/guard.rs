@@ -115,7 +115,12 @@ impl Guard {
         let regs = state.load_regs();
         let (events, _) = broadcast::channel(256);
         let exec = (!settings.observe).then(|| {
-            Executor::new(Arc::new(RealSys), Arc::new(RealHooks), std::time::Duration::from_millis(settings.kill_grace_ms), state.path())
+            Executor::new(
+                Arc::new(RealSys::default()),
+                Arc::new(RealHooks),
+                std::time::Duration::from_millis(settings.kill_grace_ms),
+                state.path(),
+            )
         });
         if let Some(x) = &exec {
             // processes a previous run of this guard left stopped are continued
@@ -310,6 +315,7 @@ impl Guard {
             let u = d.key.as_ref().and_then(|k| g.units.iter().find(|u| &u.key == k).cloned());
             todo.push((d, u));
         }
+        let paused_keys = g.engine.paused_keys();
         drop(g);
         let Some(x) = &self.exec else { return };
         for (d, u) in todo {
@@ -325,6 +331,8 @@ impl Guard {
                 _ => {}
             }
         }
+        // anything recorded as stopped that the engine no longer holds as paused is continued now (note 43)
+        x.reconcile(&paused_keys);
     }
 
     fn record(&self, g: &mut Inner, d: Decision) -> Decision {
