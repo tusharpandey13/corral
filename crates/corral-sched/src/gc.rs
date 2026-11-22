@@ -50,6 +50,8 @@ pub fn run(svc: &Service, now: i64) -> io::Result<usize> {
             remaining.push((id, upload));
         }
     }
+    // The audit trail is kept as long as finished jobs are.
+    let _ = svc.db().prune_audit(now - st.retention_age_ms);
     // Still over the size cap: oldest unprotected first.
     for (id, upload) in remaining {
         if storage_bytes(svc) <= cap {

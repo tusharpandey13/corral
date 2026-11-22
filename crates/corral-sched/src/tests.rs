@@ -872,3 +872,41 @@ fn heartbeats_keep_a_slow_claim_alive() {
     let j = r.get(&id);
     assert_eq!((j.state, j.attempts), (JobState::Claimed, 1), "four minutes of input fetching with heartbeats is not an abandoned claim");
 }
+
+// ---- M1 review minors ----
+
+/// Progress is accepted only from the worker that holds the job (R-SEC-02 / R-IO-06).
+#[test]
+fn progress_only_from_the_jobs_worker() {
+    let r = rig();
+    let id = r.submit(&heavy(10));
+    r.run_job("w", &[], &id);
+    r.svc.progress("intruder", &id, 99);
+    assert_eq!(r.get(&id).progress, None, "another worker cannot set progress");
+    r.svc.progress("w", &id, 40);
+    assert_eq!(r.get(&id).progress, Some(40));
+}
+
+/// R-IO-05: old audit rows are pruned with the retention run, recent ones stay.
+#[test]
+fn retention_prunes_the_audit_table() {
+    let r = rig_with(|s| s.retention_age_ms = 14 * 86_400_000);
+    r.submit(&heavy(10));
+    let before = r.svc.db().audit_count("api").unwrap();
+    assert!(before > 0);
+    r.clock.advance_s(15 * 86_400);
+    r.svc.db().audit_write(r.clock.now_ms(), "owner", "x", None, "api", "recent");
+    crate::gc::run(&r.svc, r.clock.now_ms()).unwrap();
+    assert_eq!(r.svc.db().audit_count("api").unwrap(), 1, "only the recent row is left");
+}
+
+/// R-IO-01 (M1 review): the artifact cap has a server-side maximum and cannot overflow.
+#[test]
+fn artifacts_cap_has_a_server_side_maximum() {
+    let r = rig();
+    let mut s = heavy(10);
+    s.artifacts_max_mb = u64::MAX;
+    let e = r.api::<_, SubmitReply>(&agent(), "submit", &s).unwrap_err();
+    assert_eq!(e.error, ErrorCode::BadRequest);
+    assert_eq!(e.extra["field"], "artifacts_max_mb");
+}

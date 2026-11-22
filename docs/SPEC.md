@@ -945,3 +945,6 @@ owner prefers otherwise.
 23. **A log gap does not stall archiving** (PROTOCOL.md 8): recorded in the archive after `sink_hold_max` redeliveries.
 24. **Scheduler progress subscription.** The scheduler may subscribe to `corral.progress.>` (the template lacked it, so
     `status` never showed progress).
+25. **Small hardening.** Progress is accepted only from the worker that holds the job; `artifacts_max_mb` has a
+    scheduler-side ceiling (8192) checked at submit and used with saturating arithmetic; the audit (`events`) table is
+    pruned with retention.

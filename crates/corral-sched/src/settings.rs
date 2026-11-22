@@ -26,6 +26,8 @@ pub struct Settings {
     pub retry_after_s: u64,
     /// A log sequence gap is given up on (recorded in the archive) after this many redeliveries, about one a second.
     pub sink_hold_max: u64,
+    /// Server-side ceiling for a job's `artifacts_max_mb`.
+    pub artifacts_cap_mb: u64,
 }
 
 impl Settings {
@@ -48,6 +50,7 @@ impl Settings {
             upload_ttl_ms: 3_600_000,
             retry_after_s: 60,
             sink_hold_max: 30,
+            artifacts_cap_mb: 8192,
         }
     }
 

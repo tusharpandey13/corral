@@ -308,6 +308,9 @@ impl Service {
         if spec.class == Class::Heavy && spec.ram_mb.is_none_or(|r| r == 0) {
             return Err(field("ram_mb", "heavy jobs must declare ram_mb (there is no silent default)"));
         }
+        if spec.artifacts_max_mb > st.artifacts_cap_mb {
+            return Err(field("artifacts_max_mb", &format!("artifacts_max_mb is at most {}", st.artifacts_cap_mb)));
+        }
         if spec.priority > 100 {
             return Err(field("priority", "priority is 0-100"));
         }
@@ -634,8 +637,8 @@ impl Service {
     }
 
     /// Record a progress message (R-IO-06) for `status`.
-    pub fn progress(&self, job: &str, pct: u8) {
-        let _ = self.db().set_progress(job, pct);
+    pub fn progress(&self, worker: &str, job: &str, pct: u8) {
+        let _ = self.db().set_progress(job, worker, pct);
     }
 
     // ---- paths ----

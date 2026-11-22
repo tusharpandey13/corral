@@ -1055,9 +1055,18 @@ impl Store {
 
     // ---- progress ----
 
-    pub fn set_progress(&mut self, id: &str, pct: u8) -> Res<()> {
-        self.conn.execute("UPDATE jobs SET progress=?2 WHERE id=?1", params![id, pct as i64])?;
+    /// Only the worker that holds the job's live attempt may set its progress.
+    pub fn set_progress(&mut self, id: &str, worker: &str, pct: u8) -> Res<()> {
+        self.conn.execute(
+            "UPDATE jobs SET progress=?3 WHERE id=?1 AND worker=?2 AND state IN ('claimed','running','orphaned')",
+            params![id, worker, pct as i64],
+        )?;
         Ok(())
+    }
+
+    /// Drop audit rows older than `before` (the `events` table otherwise grows for ever).
+    pub fn prune_audit(&mut self, before: i64) -> Res<usize> {
+        Ok(self.conn.execute("DELETE FROM events WHERE t < ?1", [before])?)
     }
 
     // ---- log sink (R-IO-03, U-25) ----

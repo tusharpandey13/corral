@@ -242,8 +242,9 @@ pub async fn run(
         handles.push(tokio::spawn(async move {
             while let Some(msg) = sub.next().await {
                 let parts: Vec<&str> = msg.subject.as_str().split('.').collect();
-                if let ([_, _, _, id], Ok(p)) = (&parts[..], serde_json::from_slice::<ProgressMsg>(&msg.payload)) {
-                    svc.progress(id, p.pct);
+                // corral.progress.<worker>.<id>: the worker in the subject must be the one that holds the job.
+                if let ([_, _, worker, id], Ok(p)) = (&parts[..], serde_json::from_slice::<ProgressMsg>(&msg.payload)) {
+                    svc.progress(worker, id, p.pct);
                 }
             }
         }));
