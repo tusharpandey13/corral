@@ -592,8 +592,11 @@ fn claim_that_is_never_started_times_out_as_a_decline() {
     let r = rig();
     let id = r.submit(&heavy(10));
     r.claim("w", &r.claim_req(&[], 1, 1000));
-    r.clock.advance_s(121);
-    r.tick();
+    // Tick once per second like the real loop: the 90 s lease runs out before the 120 s claim deadline.
+    for _ in 0..121 {
+        r.clock.advance_s(1);
+        r.tick();
+    }
     let j = r.get(&id);
     assert_eq!((j.state, j.attempts), (JobState::Queued, 0));
     assert!(j.waiting.iter().any(|w| w.text.contains("claim_timeout")), "{:?}", j.waiting);

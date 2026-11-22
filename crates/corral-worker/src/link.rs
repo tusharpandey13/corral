@@ -35,7 +35,9 @@ pub struct NatsLink {
 
 impl SchedLink for NatsLink {
     async fn claim(&self, req: &ClaimReq) -> Result<ClaimReply, ApiError> {
-        self.bus.call(&subjects::claim(&self.host), req).await
+        // Same req_id on each retry: the scheduler answers a repeated claim with the original reply, so a lost
+        // reply cannot strand a claimed job until the claim deadline.
+        self.bus.call_retry(&subjects::claim(&self.host), req, 3).await
     }
 
     async fn heartbeat(&self, job: &str, hb: &HbReq) -> Result<HbReply, ApiError> {

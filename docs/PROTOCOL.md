@@ -170,7 +170,8 @@ States: `uploading`, `queued`, `claimed`, `running`, `orphaned` (non-terminal); 
 | claimed, running | killed | `finished{outcome: killed}`; scheduler timeout backstop | **terminal; never requeued** (R-QUEUE-04) |
 | any non-terminal | cancelled | cancel | running: ctl push + hb flag; worker kills then reports `finished{reason: cancelled}` |
 | claimed, running | orphaned | no valid heartbeat for `lease_ttl` | |
-| orphaned | running | heartbeat with the current token | worker woke up / network back |
+| orphaned | running | heartbeat with the current token, attempt had `started` | worker woke up / network back |
+| orphaned | claimed | heartbeat with the current token, attempt never `started` | `started` / `declined` still accepted; the claim deadline still applies |
 | orphaned | queued | grace over, `retry_on_lost`, attempts < max | old token revoked |
 | orphaned | lost | grace over, no retry left | terminal |
 | claimed, running | lost | `finished{outcome: lost_local}` (worker restarted and found the attempt dead without having seen it end) | then requeue rule as above |
@@ -216,6 +217,10 @@ Reply: `{"v":1, "job": <job record> | null, "attempt":1, "lease_token":"<128-bit
 
 The worker then performs local admission under the lock (GUARDS.md §7) and sends `started` or `declined` within
 `claim_deadline` (default 120 s; past that the scheduler treats the claim as declined with reason `claim_timeout`).
+*Implementation note (M1 review):* the 90 s lease runs out before the 120 s deadline, so the deadline is also applied
+to a never-started claim that has turned `orphaned`; it is a decline either way, never a lost attempt. A claim request
+is retried with the same `req_id` (the scheduler replays its answer), so a lost reply does not strand the job. A
+cancel that races with a decline, `lost_local` or the claim deadline ends the job `cancelled`; it is never requeued.
 
 ### 6.2 Heartbeat
 

@@ -20,8 +20,11 @@ pub enum Event {
     Killed,
     Cancel,
     LeaseExpired,
-    /// A valid heartbeat with the current token.
+    /// A valid heartbeat with the current token, for an attempt that had started.
     Heartbeat,
+    /// A valid heartbeat with the current token, for an attempt that never reported `started`: it returns to
+    /// `claimed` (the claim deadline and the decline path still apply), never to `running`.
+    HeartbeatUnstarted,
     /// Orphan grace over and the job may be retried.
     GraceOverRequeue,
     /// Orphan grace over, no retry left.
@@ -33,7 +36,7 @@ pub enum Event {
 }
 
 impl Event {
-    pub const ALL: [Event; 16] = [
+    pub const ALL: [Event; 17] = [
         Event::UploadVerified,
         Event::UploadFailed,
         Event::Claim,
@@ -45,6 +48,7 @@ impl Event {
         Event::Cancel,
         Event::LeaseExpired,
         Event::Heartbeat,
+        Event::HeartbeatUnstarted,
         Event::GraceOverRequeue,
         Event::GraceOverLost,
         Event::LostLocalRequeue,
@@ -80,6 +84,7 @@ pub fn next(from: JobState, ev: Event) -> Result<JobState, IllegalTransition> {
         (Uploading | Queued | Claimed | Running | Orphaned, Cancel) => Cancelled,
         (Claimed | Running, LeaseExpired) => Orphaned,
         (Orphaned, Heartbeat) => Running,
+        (Orphaned, HeartbeatUnstarted) => Claimed,
         (Orphaned, GraceOverRequeue) => Queued,
         (Orphaned, GraceOverLost) => Lost,
         (Claimed | Running, LostLocalRequeue) => Queued,
@@ -118,6 +123,7 @@ mod tests {
             (Claimed, Event::LeaseExpired, Orphaned),
             (Running, Event::LeaseExpired, Orphaned),
             (Orphaned, Event::Heartbeat, Running),
+            (Orphaned, Event::HeartbeatUnstarted, Claimed),
             (Orphaned, Event::GraceOverRequeue, Queued),
             (Orphaned, Event::GraceOverLost, Lost),
             (Claimed, Event::LostLocalRequeue, Queued),
@@ -138,7 +144,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 11 * 16);
+        assert_eq!(checked, 11 * 17);
     }
 
     /// R-QUEUE-04: nothing leaves `killed` (a killed job is final), nor any other terminal state.
