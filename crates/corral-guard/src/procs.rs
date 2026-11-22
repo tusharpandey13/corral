@@ -335,6 +335,10 @@ pub struct Unit {
     pub reg_name: Option<String>,
     pub leader: u32,
     pub pids: Vec<u32>,
+    /// `ps` start time of each pid in `pids` (same order): what a signal re-verifies (pid reuse, R-GUARD-04).
+    pub starts: Vec<String>,
+    /// The process group to signal as a whole: set only when the unit *is* a group led by `leader` (pgid == pid).
+    pub pgid: Option<u32>,
     pub comm: String,
     pub footprint_mb: u64,
 }
@@ -403,10 +407,12 @@ pub fn build_units(table: &[ProcInfo], src: &dyn ProcSource, rules: &Rules<'_>, 
             || rules.never.iter().any(|s| s.matches(p, &cx))
     };
     let mut never: HashSet<u32> = HashSet::new();
-    let mut unit_for = |matcher: &Matcher, key: String, mut pids: Vec<u32>, leader: u32, reg: Option<&Registration>| -> Unit {
+    let mut unit_for = |matcher: &Matcher, key: String, mut pids: Vec<u32>, leader: u32, reg: Option<&Registration>, group: bool| -> Unit {
         pids.sort_unstable();
         pids.dedup();
         let leader_p = cx.by_pid.get(&leader);
+        let starts: Vec<String> = pids.iter().map(|p| cx.by_pid.get(p).map(|x| x.start.clone()).unwrap_or_default()).collect();
+        let pgid = (group && leader_p.is_some_and(|l| l.pgid == leader)).then_some(leader);
         let footprint_kb: u64 = pids.iter().filter_map(|p| cx.by_pid.get(p)).map(|p| p.rss_kb).sum();
         let ids = rules.protect.get(&matcher.name);
         let protected_by_id = match ids {
@@ -445,6 +451,8 @@ pub fn build_units(table: &[ProcInfo], src: &dyn ProcSource, rules: &Rules<'_>, 
             reg_name: reg.map(|r| r.name.clone()),
             leader,
             pids,
+            starts,
+            pgid,
             comm: leader_p.map(|p| p.comm()).unwrap_or_default(),
             footprint_mb: footprint_kb / 1024,
         }
@@ -479,7 +487,7 @@ pub fn build_units(table: &[ProcInfo], src: &dyn ProcSource, rules: &Rules<'_>, 
         let leader = cx.by_pid[&r.pid];
         let m = rules.matchers.iter().find(|m| m.select.matches(leader, &cx)).unwrap_or(&implicit);
         claimed.extend(members.iter().copied());
-        units.push(unit_for(m, format!("reg:{}", r.id), members.clone(), r.pid, Some(r)));
+        units.push(unit_for(m, format!("reg:{}", r.id), members.clone(), r.pid, Some(r), r.pgid == r.pid));
     }
     // unregistered processes: first matching matcher wins
     let mut matched: Vec<(u32, usize)> = Vec::new();
@@ -496,8 +504,8 @@ pub fn build_units(table: &[ProcInfo], src: &dyn ProcSource, rules: &Rules<'_>, 
         }
         let m = &rules.matchers[*mi];
         let p = cx.by_pid[pid];
-        let (key, members, leader) = match m.unit {
-            UnitKind::Process => (format!("p:{pid}@{}", p.start), vec![*pid], *pid),
+        let (key, members, leader, group) = match m.unit {
+            UnitKind::Process => (format!("p:{pid}@{}", p.start), vec![*pid], *pid, false),
             UnitKind::Cgroup => match src.cgroup(*pid) {
                 Some(cg) => {
                     let all: Vec<u32> = matched
@@ -505,9 +513,9 @@ pub fn build_units(table: &[ProcInfo], src: &dyn ProcSource, rules: &Rules<'_>, 
                         .filter(|(q, qi)| qi == mi && src.cgroup(*q).as_deref() == Some(cg.as_str()))
                         .map(|(q, _)| *q)
                         .collect();
-                    (format!("c:{cg}"), all, *pid)
+                    (format!("c:{cg}"), all, *pid, false)
                 }
-                None => (format!("p:{pid}@{}", p.start), vec![*pid], *pid),
+                None => (format!("p:{pid}@{}", p.start), vec![*pid], *pid, false),
             },
             UnitKind::Group => {
                 // The whole group only when its leader is itself matched: a matched process that merely shares a
@@ -515,9 +523,9 @@ pub fn build_units(table: &[ProcInfo], src: &dyn ProcSource, rules: &Rules<'_>, 
                 let leader_matched = matched_by.get(&p.pgid) == Some(mi) && cx.by_pid.contains_key(&p.pgid);
                 if leader_matched {
                     let l = cx.by_pid[&p.pgid];
-                    (format!("g:{}@{}", l.pid, l.start), unit_members(&procs, p.pgid, p.pgid).iter().map(|x| x.pid).collect(), l.pid)
+                    (format!("g:{}@{}", l.pid, l.start), unit_members(&procs, p.pgid, p.pgid).iter().map(|x| x.pid).collect(), l.pid, true)
                 } else {
-                    (format!("p:{pid}@{}", p.start), descendants(&children, *pid), *pid)
+                    (format!("p:{pid}@{}", p.start), descendants(&children, *pid), *pid, false)
                 }
             }
         };
@@ -525,7 +533,7 @@ pub fn build_units(table: &[ProcInfo], src: &dyn ProcSource, rules: &Rules<'_>, 
             continue;
         }
         claimed.extend(members.iter().copied());
-        units.push(unit_for(m, key, members, leader, None));
+        units.push(unit_for(m, key, members, leader, None, group));
     }
     units.sort_by(|a, b| (a.tier, &a.key).cmp(&(b.tier, &b.key)));
     units

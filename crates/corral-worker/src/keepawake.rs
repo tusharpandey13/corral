@@ -98,10 +98,7 @@ impl HoldCli {
                 s
             })
         };
-        let (to, te) = (
-            out.take().map(|o| reader(Box::new(o))),
-            err.take().map(|e| reader(Box::new(e))),
-        );
+        let (to, te) = (out.take().map(|o| reader(Box::new(o))), err.take().map(|e| reader(Box::new(e))));
         let deadline = Instant::now() + self.timeout;
         let status = loop {
             match child.try_wait() {
@@ -117,7 +114,11 @@ impl HoldCli {
         };
         let stdout = to.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
         let stderr = te.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-        let text = if status.success() { stdout } else { format!("{}{}", stderr.trim(), if stderr.trim().is_empty() { stdout } else { String::new() }) };
+        let text = if status.success() {
+            stdout
+        } else {
+            format!("{}{}", stderr.trim(), if stderr.trim().is_empty() { stdout } else { String::new() })
+        };
         Ok((status.code().unwrap_or(-1), text))
     }
 
@@ -133,10 +134,7 @@ impl HoldCli {
 
 /// `hold corral:x until 2026-11-22 18:00:00 (pid 123)` -> the pid, if printed.
 fn parse_hold_line(owner: &str, text: &str) -> HoldInfo {
-    let pid = text
-        .rsplit_once("(pid ")
-        .and_then(|(_, r)| r.split(')').next())
-        .and_then(|n| n.trim().parse().ok());
+    let pid = text.rsplit_once("(pid ").and_then(|(_, r)| r.split(')').next()).and_then(|n| n.trim().parse().ok());
     HoldInfo { owner: owner.into(), until: None, pid, bound_pid: None, display: false }
 }
 
@@ -174,7 +172,8 @@ impl KeepAwake for HoldCli {
 
     fn hold(&self, owner: &str, dur: Duration, bound_pid: Option<u32>, display: bool) -> Result<HoldInfo, String> {
         valid_owner(owner)?;
-        let mut args: Vec<String> = vec!["hold".into(), "--for".into(), format!("{}s", dur.as_secs().max(1)), "--owner".into(), owner.into()];
+        let mut args: Vec<String> =
+            vec!["hold".into(), "--for".into(), format!("{}s", dur.as_secs().max(1)), "--owner".into(), owner.into()];
         if let Some(p) = bound_pid {
             args.extend(["--pid".into(), p.to_string()]);
         }
@@ -270,7 +269,12 @@ impl KeepAwake for FakeKeepAwake {
     }
     fn hold(&self, owner: &str, dur: Duration, bound_pid: Option<u32>, display: bool) -> Result<HoldInfo, String> {
         self.check()?;
-        self.calls.lock().unwrap_or_else(|e| e.into_inner()).push(Call::Hold { owner: owner.into(), secs: dur.as_secs(), bound_pid, display });
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).push(Call::Hold {
+            owner: owner.into(),
+            secs: dur.as_secs(),
+            bound_pid,
+            display,
+        });
         Ok(HoldInfo { owner: owner.into(), until: None, pid: None, bound_pid, display })
     }
     fn release(&self, owner: &str) -> Result<(), String> {

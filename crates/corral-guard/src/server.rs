@@ -164,11 +164,17 @@ pub async fn serve(guard: Arc<Guard>, stop: impl std::future::Future<Output = ()
 /// `corral guard run`: take the instance lock, make one decision round, then serve until `stop`.
 pub async fn run(settings: GuardSettings, stop: impl std::future::Future<Output = ()>) -> Result<(), String> {
     let _lock = instance_lock(&settings.state_dir)?;
-    tracing::info!(mode = "observe", socket = %settings.socket.display(), "guard starting: decisions are logged, no process is signalled");
+    if settings.observe {
+        tracing::info!(mode = "observe", socket = %settings.socket.display(), "guard starting: decisions are logged, no process is signalled");
+    } else {
+        tracing::warn!(mode = "enforce", socket = %settings.socket.display(), "guard starting in ENFORCE mode: it will signal the processes it watches");
+    }
     let guard = Arc::new(Guard::new(settings.clone(), host_deps(&settings))?);
     {
         let g = guard.clone();
         tokio::task::spawn_blocking(move || g.tick()).await.map_err(|e| e.to_string())?;
     }
-    serve(guard, stop).await
+    let r = serve(guard.clone(), stop).await;
+    guard.shutdown();
+    r
 }

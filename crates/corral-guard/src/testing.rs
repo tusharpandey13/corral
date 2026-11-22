@@ -85,18 +85,24 @@ impl Rig {
     }
 
     pub fn in_dir(dir: &Path, extra: &str) -> Rig {
-        Rig::build(dir, extra, false)
+        Rig::build(dir, extra, false, "observe")
     }
 
     /// With the host's real process table (`ps`), for tests that start their own sentinel processes.
     pub fn with_real_ps(extra: &str) -> Rig {
-        Rig::build(&tmpdir("rig"), extra, true)
+        Rig::build(&tmpdir("rig"), extra, true, "observe")
     }
 
-    fn build(dir: &Path, extra: &str, real_ps: bool) -> Rig {
+    /// Enforce mode with the real process table: for tests that start their own processes and watch them die.
+    pub fn enforcing(extra: &str) -> Rig {
+        Rig::build(&tmpdir("rig"), extra, true, "enforce")
+    }
+
+    fn build(dir: &Path, extra: &str, real_ps: bool, mode: &str) -> Rig {
         let cfg_text = format!(
-            "version = 1\nhost = \"laptop\"\n[guard]\nmode = \"observe\"\nsample = \"1h\"\nstate_dir = \"{d}/state\"\nsocket = \"{d}/g.sock\"\nmin_disk = \"1G\"\n{extra}",
-            d = dir.display()
+            "version = 1\nhost = \"laptop\"\n[guard]\nmode = \"{mode}\"\nkill_grace = \"400ms\"\nsample = \"1h\"\nstate_dir = \"{d}/state\"\nsocket = \"{d}/g.sock\"\nmin_disk = \"1G\"\n{extra}",
+            d = dir.display(),
+            mode = mode
         );
         let config_path = dir.join("corral.toml");
         std::fs::write(&config_path, &cfg_text).unwrap();
