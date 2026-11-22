@@ -404,7 +404,11 @@ behaviour lives in the companion documents named per group.
   a command below it runs locally under guard (`corral local --guard`: timeout, low CPU/IO weight, memory cap).
   **AC (thresholds):** offline W, weight 1 → guarded local; weight 2 and 3 → queued; changing `wait_threshold` to 3
   moves weight 2 to guarded local. Every decision is logged. An `observe` mode logs the decision and changes nothing.
-  **AC:** for each decision a fixture event produces the expected harness output; observe mode never changes input.
+  Hook mode is the **only** rewriting hook: other rewriters are chained inside it (configured command list, each fed
+  the previous output), because harnesses may run hooks in parallel and keep only one rewrite (Q17). It returns a
+  rewrite without overriding the harness's permission decision unless configured to.
+  **AC:** for each decision a fixture event produces the expected harness output; observe mode never changes input;
+  a chained rewriter's output is the input to placement.
 - **R-PLACE-04** Presence for hook decisions is read from a local cache (`corral workers --watch`), so a decision
   makes no network call; p95 decision time < 50 ms. **AC:** benchmark over the golden corpus.
 - **R-PLACE-05** Escape hatch: a configured marker comment (default `# @local`) or `corral local --reason TEXT -- CMD`
@@ -846,7 +850,9 @@ working tree; keep-awake holds; a queue that tolerates workers offline for days.
   configured, else `scratch`.
 - **Q16. (decided: heaviness levels with a wait threshold, R-PLACE-01/03)** Hook decision when the target is
   offline: weight ≥ `wait_threshold` waits for W, below runs locally under guard.
-- **Q17. (owner: test it before hook mode ships; one combined hook in the meantime) Harness rewrite semantics** [unverified]: whether a pre-tool hook's input rewrite must be paired with an
+- **Q17. (resolved by test on one harness version: rewrites need no allow decision and stay subject to permission
+  rules, matched on the rewritten command; parallel hooks that both rewrite race and one is dropped; so hook mode must
+  be the single rewriting entry point and chain other rewriters itself, R-PLACE-03) Harness rewrite semantics**: whether a pre-tool hook's input rewrite must be paired with an
   "allow" decision (bypassing the harness's own permission rules) and how several rewriting hooks combine. Proposed:
   one hook entry point that can chain other rewriters, until verified.
 - **Q18. (decided: command template with a foreground + result-file contract, R-AGENT-01) Agent runner contract.**
