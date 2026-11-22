@@ -11,6 +11,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// A lock file that does not parse is treated as live for this long after its last write (a holder that has just
+/// created it may not have written the content yet), and as stale after that.
+const UNPARSEABLE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub trait WallClock: Send + Sync {
     fn now_s(&self) -> f64;
 }
@@ -101,6 +105,14 @@ impl FileLock {
         f.sync_all()
     }
 
+    /// Was the lock file modified within the grace period? (A file we cannot stat counts as fresh: not stale.)
+    fn younger_than_grace(&self) -> bool {
+        std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|age| age < UNPARSEABLE_GRACE).unwrap_or(true))
+            .unwrap_or(true)
+    }
+
     fn takeover_path(&self) -> PathBuf {
         let mut p = self.path.clone().into_os_string();
         p.push(".takeover");
@@ -133,6 +145,10 @@ impl LockStore for FileLock {
                 && !h.stale(now)
             {
                 return Err(Busy(h.describe(now))); // never take over a live lock (R-LOCK-02)
+            }
+            if current.is_none() && self.younger_than_grace() {
+                // A holder may be between `O_EXCL` create and the write of its content: that is a live lock.
+                return Err(Busy(format!("lock file is unreadable but younger than {} s (being written?)", UNPARSEABLE_GRACE.as_secs())));
             }
             let holder = current.as_ref().map(|h| h.agent.clone()).unwrap_or_else(|| "unparseable lock file".into());
             let corral_holder = current.as_ref().is_some_and(|h| h.agent.starts_with("corral"));
@@ -300,6 +316,21 @@ mod tests {
         assert!(e.0.contains("not taking over a non-corral holder"), "{e:?}");
     }
 
+    /// R-LOCK-02 (M1 review): a freshly created, still empty lock file is a live holder, not a stale one, so two
+    /// acquirers can never both win.
+    #[test]
+    fn fresh_unparseable_file_is_a_live_lock() {
+        let wall = Arc::new(Wall(AtomicU64::new(1000)));
+        let path = tmp();
+        let l = FileLock::new(path.clone(), wall);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap(); // O_EXCL create done, content not yet written
+        let busy = l.acquire("corral:j-1", "job", 1, 300).unwrap_err();
+        assert!(busy.0.contains("younger"), "{busy:?}");
+        assert!(path.exists(), "the file is not removed");
+        assert!(!l.log_path().exists(), "no takeover happened");
+    }
+
     #[test]
     fn corrupt_file_is_stale() {
         let wall = Arc::new(Wall(AtomicU64::new(1000)));
@@ -307,7 +338,10 @@ mod tests {
         let l = FileLock::new(path.clone(), wall);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "not json").unwrap();
-        // R-LOCK-01: a file that does not parse is stale, so it can be taken over (and the takeover is logged)
+        // R-LOCK-01: a file that does not parse is stale (once it is older than the write grace), so it can be taken
+        // over (and the takeover is logged)
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
         l.acquire("corral:j-1", "job", 1, 300).unwrap();
         assert!(std::fs::read_to_string(l.log_path()).unwrap().contains("takeover"));
     }

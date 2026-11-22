@@ -191,11 +191,11 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
     pub async fn run_attempt(self: Arc<Self>, claim: ClaimReply, admit: Result<Ticket, Vec<DeclineReason>>) {
         let (Some(job), Some(token)) = (claim.job.clone(), claim.lease_token.clone()) else { return };
         let flags = Arc::new(AttemptFlags::new(&token));
-        self.register(&job.id, flags.clone());
+        self.register(&job.id, claim.attempt, flags.clone());
         let hb = AbortOnDrop(tokio::spawn(self.clone().hb_loop(job.id.clone(), claim.attempt, flags.clone())));
         self.attempt_body(&claim, &job, &flags, admit).await;
         drop(hb);
-        self.unregister(&job.id);
+        self.unregister(&job.id, claim.attempt);
         self.claim_notify.notify_one();
         self.presence_notify.notify_one();
     }
@@ -360,7 +360,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
                         if !s.unknown {
                             peak = peak.max(s.footprint_mb);
                             flags.footprint_mb.store(s.footprint_mb, Ordering::SeqCst);
-                            self.adm.update_footprint(&id, s.footprint_mb);
+                            self.adm.update_footprint(&id, attempt, s.footprint_mb);
                         }
                         if s.footprint_mb > budget || unknown_samples >= UNKNOWN_SAMPLES_LIMIT {
                             cause = Some(Cause::RamExceeded);

@@ -16,6 +16,18 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+/// The live attempts, keyed by job and attempt number: an old attempt finishing its cleanup never removes the entry of
+/// the attempt that replaced it.
+#[derive(Default)]
+struct Registry(HashMap<(String, u32), Arc<AttemptFlags>>);
+
+impl Registry {
+    /// The attempt of `job` whose lease token is `token` (a control push must name the current lease).
+    fn find(&self, job: &str, token: &str) -> Option<&Arc<AttemptFlags>> {
+        self.0.iter().find(|((j, _), f)| j == job && f.token == token).map(|(_, f)| f)
+    }
+}
+
 pub struct Worker<L: SchedLink, R: Runtime> {
     pub link: Arc<L>,
     pub rt: Arc<R>,
@@ -23,7 +35,7 @@ pub struct Worker<L: SchedLink, R: Runtime> {
     pub st: Arc<WorkerSettings>,
     pub claim_notify: Notify,
     pub presence_notify: Notify,
-    attempts: Mutex<HashMap<String, Arc<AttemptFlags>>>,
+    attempts: Mutex<Registry>,
     last_decline: Mutex<Option<Instant>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -37,17 +49,17 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
             st,
             claim_notify: Notify::new(),
             presence_notify: Notify::new(),
-            attempts: Mutex::new(HashMap::new()),
+            attempts: Mutex::new(Registry::default()),
             last_decline: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
         })
     }
 
-    pub(crate) fn register(&self, id: &str, f: Arc<AttemptFlags>) {
-        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).insert(id.into(), f);
+    pub(crate) fn register(&self, id: &str, attempt: u32, f: Arc<AttemptFlags>) {
+        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).0.insert((id.into(), attempt), f);
     }
-    pub(crate) fn unregister(&self, id: &str) {
-        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    pub(crate) fn unregister(&self, id: &str, attempt: u32) {
+        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).0.remove(&(id.to_string(), attempt));
     }
     pub(crate) fn note_decline(&self) {
         *self.last_decline.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
@@ -117,6 +129,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
             let Some(job) = reply.job.clone() else { return };
             let need = Need {
                 id: job.id.clone(),
+                attempt: reply.attempt,
                 class: job.spec.class,
                 ram_mb: self.ram_for(&job.spec),
                 lock: job.spec.lock.clone(),
@@ -197,15 +210,15 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         match c.action.as_str() {
             "cancel" => {
                 if let (Some(job), Some(tok)) = (&c.job, &c.lease_token)
-                    && let Some(f) = self.attempts.lock().unwrap_or_else(|e| e.into_inner()).get(job)
-                    && &f.token == tok
+                    && let Some(f) = self.attempts.lock().unwrap_or_else(|e| e.into_inner()).find(job, tok)
                 {
                     f.cancel.store(true, Ordering::SeqCst);
                 }
             }
             "kill_stale" => {
-                if let Some(job) = &c.job
-                    && let Some(f) = self.attempts.lock().unwrap_or_else(|e| e.into_inner()).get(job)
+                // Like `cancel`, it must name the lease it is about: nobody can stop a job by guessing its id.
+                if let (Some(job), Some(tok)) = (&c.job, &c.lease_token)
+                    && let Some(f) = self.attempts.lock().unwrap_or_else(|e| e.into_inner()).find(job, tok)
                 {
                     f.stale.store(true, Ordering::SeqCst);
                 }
@@ -328,5 +341,25 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         let mut t = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         t.push(tokio::spawn(self.clone().claim_loop()));
         t.push(tokio::spawn(self.clone().presence_loop()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R-QUEUE-06 (M1 review): the registry keeps attempts of one job apart, and a control push must name the
+    /// current lease token (`kill_stale` included).
+    #[test]
+    fn registry_is_per_attempt_and_token_checked() {
+        let mut r = Registry::default();
+        let (old, new) = (Arc::new(AttemptFlags::new("tok-1")), Arc::new(AttemptFlags::new("tok-2")));
+        r.0.insert(("j-1".into(), 1), old);
+        r.0.insert(("j-1".into(), 2), new.clone());
+        assert!(r.find("j-1", "tok-2").is_some_and(|f| Arc::ptr_eq(f, &new)));
+        assert!(r.find("j-1", "guess").is_none(), "a wrong token finds nothing");
+        assert!(r.find("j-2", "tok-2").is_none());
+        r.0.remove(&("j-1".to_string(), 1)); // the old attempt cleans up late
+        assert!(r.find("j-1", "tok-2").is_some(), "the new attempt is still registered");
     }
 }
