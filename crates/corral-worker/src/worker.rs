@@ -221,9 +221,9 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         self.presence_notify.notify_one();
     }
 
-    /// After a restart: any attempt the previous worker process left behind is ours to finish. A live process
-    /// group whose pid and start time we recorded is killed (never two attempts), and the attempt is reported
-    /// `lost_local`; a pending `finished` is delivered as recorded.
+    /// After a restart: any attempt the previous worker process left behind is ours to finish. Whatever is still
+    /// running of it is killed (never two attempts), and the attempt is reported `lost_local`; a pending `finished`
+    /// is delivered as recorded.
     pub async fn recover(self: &Arc<Self>) {
         let runs = self.st.work_dir.join("runs");
         let Ok(jobs) = std::fs::read_dir(&runs) else { return };
@@ -237,10 +237,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
                 let finished = match state.finished.clone() {
                     Some(f) => f,
                     None => {
-                        let now_start = crate::probe::start_time_of(state.pid);
-                        if state.pid != 0 && !now_start.is_empty() && now_start == state.start {
-                            self.kill_recorded(&state);
-                        }
+                        self.kill_leftovers(&state).await;
                         corral_proto::api::Finished {
                             outcome: "lost_local".into(),
                             exit_code: None,
@@ -269,17 +266,36 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         }
     }
 
-    /// Signal a process group recorded by a previous run of this worker. Only called after the pid's start time
-    /// matched what we recorded, so pid reuse cannot make us signal a stranger.
-    fn kill_recorded(&self, s: &AttemptState) {
-        use rustix::process::{Pid, Signal, kill_process_group};
-        if let Some(g) = Pid::from_raw(s.pgid as i32) {
-            let _ = kill_process_group(g, Signal::TERM);
-            std::thread::sleep(Duration::from_millis(self.st.kill_grace_ms.min(2000)));
-            if crate::probe::start_time_of(s.pid) == s.start {
-                let _ = kill_process_group(g, Signal::KILL);
+    /// Stop everything a previous run of this worker left behind for this attempt, whether or not its leader is
+    /// still alive: the members of the recorded process group (started no earlier than the leader, so a stranger
+    /// that reused the number is never touched) and, on Linux, any process carrying the attempt's
+    /// `CORRAL_JOB_ID`/`CORRAL_ATTEMPT`. TERM first, then KILL for whatever is still the same process after the
+    /// grace period (never two attempts, R-QUEUE-06, IT-25).
+    async fn kill_leftovers(&self, s: &AttemptState) {
+        use crate::probe::{AttemptKey, PsTable, attempt_survivors};
+        use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+        let key = AttemptKey { job: &s.job, attempt: s.attempt, pgid: s.pgid, leader_start: &s.start };
+        let signal_all = |procs: &[crate::probe::Proc], sig: Signal| {
+            if procs.iter().any(|p| p.pgid == s.pgid)
+                && let Some(g) = Pid::from_raw(s.pgid as i32)
+            {
+                let _ = kill_process_group(g, sig);
             }
+            for p in procs.iter().filter(|p| p.pgid != s.pgid) {
+                if let Some(pid) = Pid::from_raw(p.pid as i32) {
+                    let _ = kill_process(pid, sig);
+                }
+            }
+        };
+        let first = attempt_survivors(&PsTable, &key);
+        if first.is_empty() {
+            return;
         }
+        signal_all(&first, Signal::TERM);
+        tokio::time::sleep(Duration::from_millis(self.st.kill_grace_ms.min(2000))).await;
+        let still: Vec<_> =
+            attempt_survivors(&PsTable, &key).into_iter().filter(|p| first.iter().any(|f| f.pid == p.pid && f.start == p.start)).collect();
+        signal_all(&still, Signal::KILL);
     }
 
     /// Remove finished runs older than `keep_failed_runs`.

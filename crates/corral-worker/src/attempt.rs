@@ -21,6 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
+/// Consecutive one-second samples without a readable footprint after which the job is stopped (fail closed).
+const UNKNOWN_SAMPLES_LIMIT: u32 = 5;
+
 /// State shared between the attempt task, its heartbeat task and control pushes.
 pub struct AttemptFlags {
     pub token: String,
@@ -331,6 +334,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         let mut term_at: Option<Instant> = None;
         let mut kill_sent = false;
         let mut peak = 0u64;
+        let mut unknown_samples = 0u32;
         let mut last_sample = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
         let exit = {
             let wait = self.rt.wait(&running);
@@ -350,10 +354,15 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
                     } else if last_sample.elapsed() >= Duration::from_secs(1) {
                         last_sample = Instant::now();
                         let s = self.rt.sample(&running);
-                        peak = peak.max(s.footprint_mb);
-                        flags.footprint_mb.store(s.footprint_mb, Ordering::SeqCst);
-                        self.adm.update_footprint(&id, s.footprint_mb);
-                        if s.footprint_mb > budget {
+                        // An unmeasurable job is not a job that uses no memory: after a few samples in a row the
+                        // guard fails closed and stops it as `ram_exceeded`.
+                        unknown_samples = if s.unknown { unknown_samples + 1 } else { 0 };
+                        if !s.unknown {
+                            peak = peak.max(s.footprint_mb);
+                            flags.footprint_mb.store(s.footprint_mb, Ordering::SeqCst);
+                            self.adm.update_footprint(&id, s.footprint_mb);
+                        }
+                        if s.footprint_mb > budget || unknown_samples >= UNKNOWN_SAMPLES_LIMIT {
                             cause = Some(Cause::RamExceeded);
                         }
                     }

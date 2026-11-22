@@ -5,7 +5,7 @@
 //! recorded itself (pid plus start time); nothing is ever killed by name.
 
 use crate::input;
-use crate::probe::{ProcessTable, PsTable, footprint_mb, unit_members};
+use crate::probe::{ProcessTable, PsTable, footprint_mb, unit_members_tagged};
 use crate::runtime::*;
 use corral_proto::job::{Class, Input};
 use std::collections::HashMap;
@@ -33,6 +33,8 @@ pub struct NativeRunning {
     pgid: u32,
     out: PathBuf,
     err: PathBuf,
+    /// Environment entries every descendant inherits (Linux): finds children that escaped the process group.
+    tag: Vec<String>,
     /// Descendants that left the process group (setsid): pid -> start time, recorded while sampling.
     escapees: Mutex<HashMap<u32, String>>,
 }
@@ -86,15 +88,27 @@ fn sig(s: UnitSignal) -> rustix::process::Signal {
     }
 }
 
-fn signal_unit(table: &dyn ProcessTable, r: &NativeRunning, s: UnitSignal) {
-    let snap = table.snapshot();
-    let members = unit_members(&snap, r.pgid, r.pid);
-    {
-        let mut esc = r.escapees.lock().unwrap_or_else(|e| e.into_inner());
-        for m in members.iter().filter(|m| m.pgid != r.pgid) {
-            esc.insert(m.pid, m.start.clone());
-        }
+/// The unit's members in `snap`; descendants that left the process group are recorded as escapees.
+fn members_of(table: &dyn ProcessTable, r: &NativeRunning, snap: &[crate::probe::Proc]) -> Vec<crate::probe::Proc> {
+    let members = unit_members_tagged(table, snap, r.pgid, r.pid, &r.tag);
+    let mut esc = r.escapees.lock().unwrap_or_else(|e| e.into_inner());
+    for m in members.iter().filter(|m| m.pgid != r.pgid) {
+        esc.insert(m.pid, m.start.clone());
     }
+    members
+}
+
+/// Measure the unit. An unreadable or empty table is `unknown`, never a footprint of zero (fail closed).
+fn measure(table: &dyn ProcessTable, r: &NativeRunning) -> Sample {
+    let Some(snap) = table.snapshot() else { return Sample { footprint_mb: 0, alive: true, unknown: true } };
+    let members = members_of(table, r, &snap);
+    Sample { footprint_mb: footprint_mb(&members), alive: !members.is_empty(), unknown: members.is_empty() }
+}
+
+fn signal_unit(table: &dyn ProcessTable, r: &NativeRunning, s: UnitSignal) {
+    // The group signal needs no table; recorded escapees are signalled only when the table could be read.
+    let snap = table.snapshot().unwrap_or_default();
+    members_of(table, r, &snap);
     if let Some(g) = rustix::process::Pid::from_raw(r.pgid as i32) {
         let _ = rustix::process::kill_process_group(g, sig(s));
     }
@@ -189,7 +203,8 @@ impl Runtime for NativeRuntime {
             .kill_on_drop(false);
         let child = c.spawn().map_err(|e| RuntimeError::Spawn(format!("{}: {e}", cmd[0])))?;
         let pid = child.id().ok_or_else(|| RuntimeError::Spawn("child exited before it could be tracked".into()))?;
-        Ok(NativeRunning { child: tokio::sync::Mutex::new(child), pid, pgid: pid, out, err, escapees: Mutex::new(HashMap::new()) })
+        let tag = vec![format!("CORRAL_JOB_ID={}", ctx.job_id), format!("CORRAL_ATTEMPT={}", ctx.attempt)];
+        Ok(NativeRunning { child: tokio::sync::Mutex::new(child), pid, pgid: pid, out, err, tag, escapees: Mutex::new(HashMap::new()) })
     }
 
     fn info(&self, r: &NativeRunning) -> RunInfo {
@@ -197,15 +212,7 @@ impl Runtime for NativeRuntime {
     }
 
     fn sample(&self, r: &NativeRunning) -> Sample {
-        let snap = self.table.snapshot();
-        let members = unit_members(&snap, r.pgid, r.pid);
-        {
-            let mut esc = r.escapees.lock().unwrap_or_else(|e| e.into_inner());
-            for m in members.iter().filter(|m| m.pgid != r.pgid) {
-                esc.insert(m.pid, m.start.clone());
-            }
-        }
-        Sample { footprint_mb: footprint_mb(&members), alive: !members.is_empty() }
+        measure(self.table.as_ref(), r)
     }
 
     fn signal(&self, r: &NativeRunning, s: UnitSignal) -> Result<(), RuntimeError> {
@@ -242,5 +249,43 @@ impl Runtime for NativeRuntime {
         })
         .await
         .map_err(|e| RuntimeError::Other(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::Proc;
+
+    struct Table(Option<Vec<Proc>>);
+    impl ProcessTable for Table {
+        fn snapshot(&self) -> Option<Vec<Proc>> {
+            self.0.clone()
+        }
+    }
+
+    fn running() -> NativeRunning {
+        let child = Command::new("sleep").arg("30").kill_on_drop(true).spawn().expect("sleep");
+        NativeRunning {
+            child: tokio::sync::Mutex::new(child),
+            pid: 40_000,
+            pgid: 40_000,
+            out: PathBuf::new(),
+            err: PathBuf::new(),
+            tag: vec![],
+            escapees: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// G1 (M1 review): an unreadable or empty process table is "unknown", never a footprint of zero.
+    #[tokio::test]
+    async fn unreadable_table_is_unknown_not_zero() {
+        let r = running();
+        assert!(measure(&Table(None), &r).unknown);
+        assert!(measure(&Table(Some(vec![])), &r).unknown, "the unit cannot be empty while its leader runs");
+        let p = Proc { pid: 40_000, ppid: 1, pgid: 40_000, rss_kb: 2048, start: "x".into() };
+        let s = measure(&Table(Some(vec![p])), &r);
+        assert!(!s.unknown);
+        assert_eq!(s.footprint_mb, 2);
     }
 }

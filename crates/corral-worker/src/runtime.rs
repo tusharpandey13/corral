@@ -46,6 +46,9 @@ pub struct RunInfo {
 pub struct Sample {
     pub footprint_mb: u64,
     pub alive: bool,
+    /// The footprint could not be measured (process table unreadable or empty). Never read as "uses no memory":
+    /// the worker fails closed after a few consecutive unknown samples.
+    pub unknown: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

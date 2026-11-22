@@ -80,6 +80,8 @@ pub enum Behavior {
     ExternalSignal { after_ms: u64 },
     /// Run until KILLed: TERM is ignored.
     IgnoreTerm,
+    /// Hang, and the footprint can never be measured (`ps` failing).
+    Unmeasurable,
     /// Grow beyond the declared RAM, then hang.
     Grow { footprint_mb: u64 },
 }
@@ -89,6 +91,7 @@ pub struct FakeState {
     notify: Notify,
     footprint: Mutex<u64>,
     ignore_term: bool,
+    unknown: bool,
 }
 
 pub struct FakeRunning {
@@ -139,7 +142,8 @@ impl Runtime for FakeRuntime {
         std::fs::write(&out, "").map_err(|e| RuntimeError::Other(e.to_string()))?;
         let behavior = (self.behavior)(&ctx.spec);
         let ignore_term = matches!(behavior, Behavior::IgnoreTerm);
-        let st = Arc::new(FakeState { exit: Mutex::new(None), notify: Notify::new(), footprint: Mutex::new(1), ignore_term });
+        let unknown = matches!(behavior, Behavior::Unmeasurable);
+        let st = Arc::new(FakeState { exit: Mutex::new(None), notify: Notify::new(), footprint: Mutex::new(1), ignore_term, unknown });
         match behavior {
             Behavior::Exit { code, after_ms, stdout } => {
                 let (st2, out2) = (st.clone(), out.clone());
@@ -149,7 +153,7 @@ impl Runtime for FakeRuntime {
                     st2.finish(ExitInfo { code: Some(code), signal: None, by_runtime: None });
                 });
             }
-            Behavior::Hang | Behavior::IgnoreTerm => {}
+            Behavior::Hang | Behavior::IgnoreTerm | Behavior::Unmeasurable => {}
             Behavior::ExternalSignal { after_ms } => {
                 let st2 = st.clone();
                 tokio::spawn(async move {
@@ -167,7 +171,7 @@ impl Runtime for FakeRuntime {
     }
 
     fn sample(&self, r: &FakeRunning) -> Sample {
-        Sample { footprint_mb: *r.st.footprint.lock().unwrap(), alive: r.st.exit.lock().unwrap().is_none() }
+        Sample { footprint_mb: *r.st.footprint.lock().unwrap(), alive: r.st.exit.lock().unwrap().is_none(), unknown: r.st.unknown }
     }
 
     fn signal(&self, r: &FakeRunning, sig: UnitSignal) -> Result<(), RuntimeError> {

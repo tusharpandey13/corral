@@ -274,3 +274,13 @@ async fn term_ignoring_job_is_killed_after_the_grace() {
     let sigs = e.rt.signals.lock().unwrap().clone();
     assert_eq!(sigs, vec![UnitSignal::Term, UnitSignal::Kill], "TERM first, KILL once after the grace");
 }
+
+/// G1 / R-QUEUE-04 (M1 review): a footprint that cannot be measured (process table unreadable) is not "zero": the
+/// job is stopped `ram_exceeded` after a few samples instead of running unwatched.
+#[tokio::test]
+async fn unmeasurable_footprint_fails_closed() {
+    let e = env(|_| Behavior::Unmeasurable);
+    let id = e.submit(&heavy(100));
+    let j = e.until(&id, &[JobState::Killed]).await;
+    assert_eq!(j.reason.as_deref(), Some("ram_exceeded"));
+}
