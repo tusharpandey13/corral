@@ -199,7 +199,7 @@ async fn socket_protocol_end_to_end() {
     assert_eq!((r["v"].clone(), r["ok"].clone(), r["mode"].clone()), (json!(1), json!(true), json!("observe")));
     assert_eq!(call("nonsense", json!({})).await.unwrap().unwrap()["ok"], false);
     assert!(call("admit", json!({ "profile": "measurement" })).await.unwrap().unwrap()["error"].as_str().unwrap().contains("M4"));
-    assert!(call("hold", json!({})).await.unwrap().unwrap()["error"].as_str().unwrap().contains("M3"));
+    assert!(call("hold", json!({})).await.unwrap().unwrap()["error"].as_str().unwrap().contains("keep-awake provider"));
     let m = call("metrics", json!({})).await.unwrap().unwrap();
     assert!(
         m["text"].as_str().unwrap().contains("corral_guard_level 0")

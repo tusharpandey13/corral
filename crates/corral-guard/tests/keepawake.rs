@@ -20,7 +20,7 @@ release) exit 0;;
 holds) echo '[{"owner":"someone-else","until":1,"pid":9,"started":0,"display":0,"bound_pid":null},{"owner":"corral:j-1:1","until":1790000000,"pid":4242,"started":0,"display":0,"bound_pid":77}]';;
 esac"#;
 
-fn rig(cmd: &PathBuf, extra: &str) -> Rig {
+fn rig(cmd: &std::path::Path, extra: &str) -> Rig {
     Rig::new(&format!("[guard.keepawake]\nprovider = \"hold-cli\"\ncommand = \"{}\"\n{extra}", cmd.display()))
 }
 

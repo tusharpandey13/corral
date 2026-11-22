@@ -8,7 +8,7 @@ use corral_sched::nats::NatsConnect;
 use corral_sched::settings::Settings;
 use corral_worker::lock::{FileLock, SystemWall};
 use corral_worker::native::NativeRuntime;
-use corral_worker::probe::ProcMeminfo;
+use corral_worker::probe::host_memory;
 use corral_worker::settings::WorkerSettings;
 use std::sync::Arc;
 
@@ -48,7 +48,26 @@ pub async fn run_worker(cfg: &Config) -> Result<(), String> {
     let rt = Arc::new(NativeRuntime::new(settings.work_dir.clone(), settings.job_path.clone(), settings.env_passthrough.clone()));
     let lock = Arc::new(FileLock::new(settings.lock_path.clone(), Arc::new(SystemWall)));
     std::fs::create_dir_all(&settings.work_dir).map_err(|e| format!("work_dir {}: {e}", settings.work_dir.display()))?;
-    let worker = corral_worker::run::start(settings, bus, Arc::new(ProcMeminfo), lock, rt).await?;
+    // M3: the host guard (opt-in) and the keep-awake provider (when configured) join the admitter.
+    let use_guard = cfg.worker.as_ref().is_some_and(|w| w.use_guard);
+    let guard =
+        if use_guard { Some(Arc::new(corral_guard::client::SocketGuard { socket: crate::guardcmd::socket_path(cfg)? })) } else { None };
+    let ka = corral_worker::keepawake::from_config(cfg.guard.as_ref().and_then(|g| g.keepawake.as_ref()))?;
+    if let Some((p, _)) = &ka
+        && let Err(e) = p.probe()
+    {
+        tracing::warn!("keep-awake provider {} does not work now: {e}", p.name());
+    }
+    let worker = corral_worker::run::start_with(settings, bus, host_memory(), lock, rt, move |mut a| {
+        if let Some(g) = guard {
+            a = a.with_guard(g);
+        }
+        if let Some((p, required)) = ka {
+            a = a.with_keepawake(p, required);
+        }
+        a
+    })
+    .await?;
     tracing::info!("worker running");
     wait_for_signal().await;
     // Running jobs keep their own process groups; the next start finds and reports them (restart recovery).

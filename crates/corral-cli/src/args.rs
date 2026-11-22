@@ -81,6 +81,9 @@ pub enum Cmd {
     Admit(AdmitArgs),
     /// Run a command under the guard: admit with a reservation, take the lock, re-check under it, register, run.
     Run(RunArgs),
+    /// Legacy guard CLI on top of corral: `admit [name]`, `stop`, `resume`, `status`, `watch` with the old output and
+    /// exit codes (migration, GUARDS.md 10.2). A script installed under the legacy name runs `corral shim FLAVOR CMD`.
+    Shim(ShimArgs),
     /// Host locks (the lease-file protocol shared with the legacy lock tool).
     #[command(subcommand)]
     Lock(LockCmd),
@@ -112,6 +115,17 @@ pub enum GuardCmd {
     Status {
         #[arg(long)]
         json: bool,
+        /// The legacy guard script's output shape (first line `free=..% pressure=.. swap=..MB stop=ON|off`, or
+        /// `avail=..MB temp=..C stop=..` on Linux, then `tier N: pids`).
+        #[arg(long)]
+        legacy_output: bool,
+    },
+    /// Block while the guard is alive (exit 1 when it goes away): lets a leftover keep-alive unit of a legacy `watch`
+    /// loop sit quietly instead of respawn-looping.
+    Await {
+        /// How often to look.
+        #[arg(long, default_value = "5s")]
+        interval: String,
     },
     /// The last decisions with their inputs: why would (or did) the guard act, and why not.
     Explain {
@@ -193,7 +207,7 @@ pub struct RunArgs {
     /// Memory budget of the command (default: --ram x 1.1).
     #[arg(long)]
     pub budget: Option<String>,
-    /// Hold the machine awake while it runs (keep-awake holds arrive with milestone M3).
+    /// Hold the machine awake while it runs (a named keep-awake hold through the guard, released on every exit path).
     #[arg(long)]
     pub hold: bool,
     /// Keep retrying admission and the lock for up to this long (1s doubling to 15s).
@@ -201,6 +215,31 @@ pub struct RunArgs {
     pub wait: Option<String>,
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ShimArgs {
+    /// `macos` (free/pressure/swap fields) or `linux` (avail/temp fields).
+    #[arg(value_parser = ["macos", "linux"])]
+    pub flavor: String,
+    /// The name the legacy command is installed under; only used in the text `stop` prints (`... until: NAME resume`).
+    #[arg(long, default_value = "guard")]
+    pub program: String,
+    #[command(subcommand)]
+    pub cmd: ShimCmd,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ShimCmd {
+    /// Heavy admission with a 60 s reservation: prints `ok` (exit 0) or `refused: REASON` (exit 1).
+    Admit {
+        name: Option<String>,
+    },
+    Stop,
+    Resume,
+    Status,
+    /// Block while the guard is alive.
+    Watch,
 }
 
 #[derive(Subcommand, Debug, Clone)]

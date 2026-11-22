@@ -4,10 +4,11 @@ Rules for AI coding agents (and humans) working in this repo. Read it in full be
 
 ## Status
 
-The specs in `docs/` were **approved by the owner on 22-Nov-2026**. **Milestone M1 is implemented** (the scheduler,
-NATS wiring, Linux worker, CLI, git/snapshot input, logs, events and artifacts, SPEC.md section 13) and **M2 is in
-review**: `corral guard` in observe mode, `admit`, `run`, `lock` and the decision comparison (SPEC.md 17.2). The
-end-to-end and chaos rubric (TESTING.md) has not been run. Later milestones (M3 and on) stay unimplemented until their
+The specs in `docs/` were **approved by the owner on 22-Nov-2026**. **Milestones M1, M2 and M3 are implemented**: M1 the scheduler, NATS wiring,
+Linux worker, CLI, git/snapshot input, logs, events and artifacts (SPEC.md section 13); M2 `corral guard` in observe mode, `admit`,
+`run`, `lock` and the decision comparison (17.2); M3 guard enforce mode, the macOS worker, keep-awake holds and the legacy shims
+(17.3). The
+end-to-end and chaos rubric (TESTING.md) has not been run. Later milestones (M4 and on) stay unimplemented until their
 turn; the round-2 drafts (exec, classifier, agent jobs,
 external tokens) are still drafts.
 
@@ -77,7 +78,7 @@ crates/
   corral-proto   message schema, subjects, versioning
   corral-sched   scheduler: job state (SQLite), placement, leases, artifacts HTTP
   corral-worker  admission, runner, host lock file, process table
-  corral-guard   the per-host guard: probes, levels, matchers, admission, kill switch, decision log (observe only: it
-                 has no signalling code, and tests/no_signals.rs keeps it so)
+  corral-guard   the per-host guard: probes, levels, matchers, admission, kill switch, decision log; observe by default. The
+                 only signalling code is src/enforce.rs (enforce mode), and tests/no_signals.rs keeps it there
   corral-cli     `corral` command
 ```

@@ -198,7 +198,7 @@ impl Guard {
                 json!({ "v": 1, "ok": true, "holds": l.iter().map(|h| json!({ "owner": h.owner, "until": h.until, "pid": h.pid, "bound_pid": h.bound_pid, "display": h.display })).collect::<Vec<_>>() })
             }),
         };
-        res.unwrap_or_else(|e| err(e))
+        res.unwrap_or_else(err)
     }
 
     /// Replace the executor (tests inject fake system calls). Enforce mode only.
@@ -607,7 +607,7 @@ impl Guard {
             }
             "explain" => {
                 let n = req.get("n").and_then(Value::as_u64).unwrap_or(20) as usize;
-                json!({ "v": 1, "ok": true, "decisions": self.lock().log.last(n, false) })
+                json!({ "v": 1, "ok": true, "now_ms": self.clock.now_ms(), "decisions": self.lock().log.last(n, false) })
             }
             "stop" => {
                 let r = self.stop(s("by").unwrap_or("cli"), s("reason").unwrap_or("no reason given"));

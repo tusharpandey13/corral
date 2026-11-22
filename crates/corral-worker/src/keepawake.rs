@@ -209,7 +209,10 @@ impl KeepAwake for HoldCli {
 
 /// Build the configured provider (`[guard.keepawake]`). No section = no provider. Returns the provider and whether
 /// heavy work requires it to work (R-AWAKE-03).
-pub fn from_config(cfg: Option<&corral_proto::guardcfg::KeepAwakeCfg>) -> Result<Option<(Arc<dyn KeepAwake>, bool)>, String> {
+/// A provider and whether heavy work requires it.
+pub type Provider = (Arc<dyn KeepAwake>, bool);
+
+pub fn from_config(cfg: Option<&corral_proto::guardcfg::KeepAwakeCfg>) -> Result<Option<Provider>, String> {
     let Some(c) = cfg else { return Ok(None) };
     for w in &c.required_for {
         if w != "heavy" {
@@ -359,9 +362,8 @@ impl HoldGuard {
             loop {
                 tokio::time::sleep(RENEW_EVERY).await;
                 let (p, o) = (p.clone(), o.clone());
-                match tokio::task::spawn_blocking(move || p.hold(&o, window, bound_pid, display)).await {
-                    Ok(Err(e)) => tracing::warn!("keep-awake renewal failed: {e}"),
-                    Err(_) | Ok(Ok(_)) => {}
+                if let Ok(Err(e)) = tokio::task::spawn_blocking(move || p.hold(&o, window, bound_pid, display)).await {
+                    tracing::warn!("keep-awake renewal failed: {e}");
                 }
             }
         });

@@ -224,6 +224,19 @@ fn first_reason(r: &Value) -> String {
     r["reasons"].as_array().and_then(|a| a.first()).and_then(|v| v["reason"].as_str()).unwrap_or("refused").to_string()
 }
 
+/// The reason of a guard `kill` decision about this run in the last two minutes, if any.
+fn killed_by_guard(sock: &std::path::Path, unit: &str) -> Option<String> {
+    let r = guard_call(sock, "explain", json!({ "n": 100 })).ok()?;
+    // the guard's own clock: the decisions carry its timestamps
+    let now = r["now_ms"].as_i64()?;
+    r["decisions"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|d| d["kind"] == "kill" && d["unit"] == unit && now - d["t_ms"].as_i64().unwrap_or(0) < 120_000)
+        .map(|d| d["reason"].as_str().unwrap_or("unknown").to_string())
+}
+
 /// `corral run`.
 pub async fn run_cmd(a: RunArgs, cfg: &Config) -> i32 {
     let ram_mb = match a.ram.as_deref().map(parse_size_mb).transpose() {
@@ -255,9 +268,6 @@ pub async fn run_cmd(a: RunArgs, cfg: &Config) -> i32 {
         },
         None => None,
     };
-    if a.hold {
-        eprintln!("corral: --hold: keep-awake holds arrive with milestone M3; running without one");
-    }
     let agent = format!("corral-run:{name}");
     let inherited = std::env::var(TOKEN_ENV).ok();
     let lock_token = lockcli::new_token();
@@ -348,7 +358,33 @@ pub async fn run_cmd(a: RunArgs, cfg: &Config) -> i32 {
         env.push((TOKEN_ENV.to_string(), lock_token));
     }
     let reg_id = std::sync::Mutex::new(None::<String>);
+    let hold_owner = format!(
+        "corral:run:{}",
+        name.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect::<String>()
+    );
+    let held = std::sync::atomic::AtomicBool::new(false);
+    let renewer = std::sync::Mutex::new(None::<tokio::task::JoinHandle<()>>);
     let result = supervise(&a.cmd, &env, |pid| {
+        if a.hold {
+            // window = 2 h + 10 min, renewed every 30 min while the command runs (GUARDS.md 8); bound to its pid
+            let window = 2 * 3600 + 600;
+            let fields = json!({ "owner": hold_owner, "for_s": window, "bound_pid": pid, "display": false });
+            match guard_call(&sock, "hold", fields.clone()) {
+                Ok(r) if r["ok"] == json!(true) => {
+                    held.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let s = sock.clone();
+                    *renewer.lock().unwrap() = Some(tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+                            let (s, f) = (s.clone(), fields.clone());
+                            let _ = tokio::task::spawn_blocking(move || guard_call(&s, "hold", f)).await;
+                        }
+                    }));
+                }
+                Ok(r) => eprintln!("corral: no keep-awake hold ({}); the host may sleep", r["error"].as_str().unwrap_or("refused")),
+                Err(e) => eprintln!("corral: no keep-awake hold ({e}); the host may sleep"),
+            }
+        }
         let start = corral_worker::probe::start_time_of(pid);
         match guard_call(
             &sock,
@@ -361,6 +397,12 @@ pub async fn run_cmd(a: RunArgs, cfg: &Config) -> i32 {
         }
     })
     .await;
+    if let Some(t) = renewer.lock().unwrap().take() {
+        t.abort();
+    }
+    if held.load(std::sync::atomic::Ordering::SeqCst) {
+        let _ = guard_call(&sock, "release_hold", json!({ "owner": hold_owner }));
+    }
     if let Some(id) = reg_id.lock().unwrap().take() {
         let _ = guard_call(&sock, "unregister", json!({ "id": id }));
     }
@@ -372,6 +414,14 @@ pub async fn run_cmd(a: RunArgs, cfg: &Config) -> i32 {
         lockcli::release(l, &agent);
     }
     match result {
+        // Died of a signal: if the guard sent it, say why and exit 125 (GUARDS.md 4.2).
+        Ok(c) if c > 128 => match killed_by_guard(&sock, &admit_name) {
+            Some(why) => {
+                eprintln!("corral: killed by the guard: {why}");
+                exitcode::JOB_ENDED
+            }
+            None => c,
+        },
         Ok(c) => c,
         Err(e) => {
             eprintln!("corral: {e}");

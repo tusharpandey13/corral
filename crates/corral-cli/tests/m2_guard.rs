@@ -367,13 +367,13 @@ fn real_daemon_one_per_host_and_the_kill_switch_persists() {
     assert!(std::fs::read_to_string(dir.join("state/decisions.jsonl")).unwrap().contains("\"kind\":\"stop\""));
 }
 
-/// `enforce` is refused in this build, naming the milestone.
+/// M3: `enforce` is accepted by the config (opt-in); an unknown mode is a usage error naming the key.
 #[test]
-fn enforce_mode_is_refused_until_m3() {
+fn guard_mode_values() {
     let dir = corral_guard::testing::tmpdir("enf");
     let cfg = dir.join("c.toml");
-    std::fs::write(&cfg, "version = 1\n[guard]\nmode = \"enforce\"\n").unwrap();
+    std::fs::write(&cfg, "version = 1\n[guard]\nmode = \"fire\"\n").unwrap();
     let o = Command::new(BIN).arg("--config").arg(&cfg).args(["guard", "run"]).output().unwrap();
     assert_eq!(o.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("M3"));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("guard.mode"));
 }
