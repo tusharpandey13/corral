@@ -130,25 +130,12 @@ fn daemons_and_client_from_config_files() {
     let (code, id, err) = corral(&agent_cfg, &["submit", "--no-input", "--light", "--", "echo hello; exit 3"]);
     assert_eq!(code, 0, "{err}");
     let id = id.trim().to_string();
-    if cfg!(target_os = "linux") {
-        let (code, out, _) = corral(&agent_cfg, &["wait", &id]);
-        assert_eq!((code, out.as_str()), (3, "hello\n"));
-        let (code, out, _) = corral(&agent_cfg, &["status", &id]);
-        assert_eq!(code, 0);
-        assert!(out.contains("failed") && out.contains("exit 3"), "{out}");
-    } else {
-        // No Linux memory probe here: admission fails closed and says why (every wait has a reason).
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let (_, out, _) = corral(&agent_cfg, &["status", &id]);
-            if out.contains("unknown") {
-                assert!(out.contains("queued"), "{out}");
-                break;
-            }
-            assert!(Instant::now() < deadline, "no waiting reason: {out}");
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    }
+    // M3: the macOS worker has a memory probe of its own (jetsam's free level), so the job runs on both platforms.
+    let (code, out, _) = corral(&agent_cfg, &["wait", &id]);
+    assert_eq!((code, out.as_str()), (3, "hello\n"));
+    let (code, out, _) = corral(&agent_cfg, &["status", &id]);
+    assert_eq!(code, 0);
+    assert!(out.contains("failed") && out.contains("exit 3"), "{out}");
     let (code, out, _) = corral(&owner_cfg, &["admin", "pause"]);
     assert_eq!((code, out.trim()), (0, "queue paused"));
     let (_, out, _) = corral(&owner_cfg, &["workers"]);

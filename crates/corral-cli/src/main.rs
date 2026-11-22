@@ -117,6 +117,7 @@ async fn run(cli: Cli) -> i32 {
         }
         Cmd::Guard(g) => return guardcmd::guard_cmd(g.clone(), &cfg),
         Cmd::Admit(a) => return guardcmd::admit_cmd(a.clone(), &cfg),
+        Cmd::Shim(a) => return guardcmd::shim_cmd(a.clone(), &cfg),
         Cmd::Run(a) => return lockcmd::run_cmd(a.clone(), &cfg).await,
         Cmd::Lock(l) => return lockcmd::lock_cmd(l.clone(), &cfg).await,
         Cmd::Config(ConfigCmd::Check { file }) => {

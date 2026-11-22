@@ -2,6 +2,8 @@
 //! memory projection, heavy slot and the host lock. The same decision is made twice: before the claim, and again
 //! while holding the lock (R-ADM-01, R-ADM-02). A decline never counts as an attempt (R-ADM-03).
 
+use crate::hostguard::{GuardReg, HostGuard};
+use crate::keepawake::{CachedProbe, KeepAwake};
 use crate::lock::LockStore;
 use crate::probe::MemoryProbe;
 use corral_proto::api::{Admission, Blocked, DeclineReason, Slots};
@@ -49,6 +51,8 @@ pub struct Admitter {
     mem: Arc<dyn MemoryProbe>,
     lock: Arc<dyn LockStore>,
     st: Arc<Mutex<State>>,
+    guard: Option<Arc<dyn HostGuard>>,
+    keepawake: Option<(Arc<dyn KeepAwake>, bool, CachedProbe)>,
 }
 
 /// Proof of admission. Dropping it frees the slot and releases the lock on every exit path.
@@ -57,9 +61,24 @@ pub struct Ticket {
     agent: Option<String>,
     lock: Arc<dyn LockStore>,
     st: Arc<Mutex<State>>,
+    guard: Option<Arc<dyn HostGuard>>,
+    /// The guard's reservation for this attempt, until the registration presents it.
+    reservation: Mutex<Option<String>>,
+    reg_id: Mutex<Option<String>>,
 }
 
 impl Ticket {
+    /// Register the started job with the guard (it then pauses or kills it by tier, budget and kill switch). The
+    /// reservation is handed over in the same call. `Err` = the guard did not take it: the job runs unwatched by the
+    /// guard (the worker's own budget watchdog still applies) and the caller says so in the job's system log.
+    pub fn register_with_guard(&self, mut r: GuardReg) -> Result<(), String> {
+        let Some(g) = &self.guard else { return Ok(()) };
+        r.reservation = self.reservation.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let id = g.register(&r)?;
+        *self.reg_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+        Ok(())
+    }
+
     pub fn holds_lock(&self) -> bool {
         self.agent.is_some()
     }
@@ -70,6 +89,14 @@ impl Ticket {
 
 impl Drop for Ticket {
     fn drop(&mut self) {
+        if let Some(g) = &self.guard {
+            if let Some(id) = self.reg_id.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                g.unregister(&id);
+            }
+            if let Some(t) = self.reservation.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                g.unreserve(&t);
+            }
+        }
         if let Some(a) = &self.agent {
             self.lock.release(a);
         }
@@ -83,7 +110,38 @@ fn reason(check: &str, text: impl Into<String>) -> DeclineReason {
 
 impl Admitter {
     pub fn new(cfg: AdmitConfig, mem: Arc<dyn MemoryProbe>, lock: Arc<dyn LockStore>) -> Admitter {
-        Admitter { cfg, mem, lock, st: Arc::new(Mutex::new(State::default())) }
+        Admitter { cfg, mem, lock, st: Arc::new(Mutex::new(State::default())), guard: None, keepawake: None }
+    }
+
+    /// Ask this guard for admission, register jobs with it and fail closed when it cannot be reached.
+    pub fn with_guard(mut self, g: Arc<dyn HostGuard>) -> Admitter {
+        self.guard = Some(g);
+        self
+    }
+
+    pub fn guard(&self) -> Option<&Arc<dyn HostGuard>> {
+        self.guard.as_ref()
+    }
+
+    /// The keep-awake provider; `required` refuses heavy work with `keepawake_unavailable` while its probe fails
+    /// (R-AWAKE-03).
+    pub fn with_keepawake(mut self, p: Arc<dyn KeepAwake>, required: bool) -> Admitter {
+        let probe = CachedProbe::new(p.clone(), std::time::Duration::from_secs(15));
+        self.keepawake = Some((p, required, probe));
+        self
+    }
+
+    pub fn keepawake(&self) -> Option<Arc<dyn KeepAwake>> {
+        self.keepawake.as_ref().map(|k| k.0.clone())
+    }
+
+    /// `Some(reason)` when heavy work is refused because a required keep-awake provider does not work.
+    fn keepawake_refusal(&self) -> Option<String> {
+        let (_, required, probe) = self.keepawake.as_ref()?;
+        if !*required {
+            return None;
+        }
+        probe.check().err().map(|e| format!("keep-awake provider unavailable: {e}"))
     }
 
     fn st(&self) -> std::sync::MutexGuard<'_, State> {
@@ -137,9 +195,25 @@ impl Admitter {
 
     /// What this worker tells the scheduler (claims and presence).
     pub fn summary(&self) -> (Slots, Admission) {
+        // Host checks first, outside our own lock (they call out to the guard and the keep-awake provider).
+        let mut host_blocked: Vec<Blocked> = Vec::new();
+        if let Some(g) = &self.guard {
+            match g.blocked() {
+                Ok(b) => host_blocked.extend(b),
+                Err(e) => host_blocked.push(Blocked {
+                    check: "guard".into(),
+                    profile: None,
+                    reason: format!("guard unreachable: {e}"),
+                    since: None,
+                }),
+            }
+        }
+        if let Some(r) = self.keepawake_refusal() {
+            host_blocked.push(Blocked { check: "keepawake_unavailable".into(), profile: None, reason: r, since: None });
+        }
         let st = self.st();
         let slots = self.slots(&st);
-        let mut blocked = Vec::new();
+        let mut blocked = host_blocked;
         let mut admissible = 0;
         match self.mem.read() {
             Ok(m) => {
@@ -166,6 +240,11 @@ impl Admitter {
         let mut why = Vec::new();
         if let Some(p) = &st.paused {
             why.push(reason("queue_not_paused", p.clone()));
+        }
+        if need.class == Class::Heavy
+            && let Some(r) = self.keepawake_refusal()
+        {
+            why.push(reason("keepawake_unavailable", r));
         }
         let slots = self.slots(st);
         match need.class {
@@ -204,27 +283,64 @@ impl Admitter {
     /// Admit a job or return the reasons it cannot start now. The full check runs a second time while holding the
     /// host lock; if it fails there, the lock is released and nothing starts (R-ADM-01).
     pub fn try_start(&self, need: &Need) -> Result<Ticket, Vec<DeclineReason>> {
-        // First check (cheap, no lock).
+        let name = format!("corral:{}:{}", need.id, need.attempt);
+        // 1. The guard's admission, with a reservation that holds the RAM and the slot until we register (GUARDS 4.1).
+        let mut reservation: Option<String> = None;
+        if let Some(g) = &self.guard {
+            match g.admit(&name, need.ram_mb, need.class, 600, None) {
+                Ok(a) if a.ok => reservation = a.reservation,
+                Ok(a) => return Err(a.reasons),
+                Err(e) => return Err(vec![reason("guard", format!("guard unreachable: {e}"))]),
+            }
+        }
+        let undo = |why: Vec<DeclineReason>| {
+            if let (Some(g), Some(t)) = (&self.guard, &reservation) {
+                g.unreserve(t);
+            }
+            Err(why)
+        };
+        // 2. The worker's own first check (cheap, no lock).
         {
             let st = self.st();
-            self.check(need, &st)?;
+            if let Err(why) = self.check(need, &st) {
+                return undo(why);
+            }
         }
         let wants_lock = need.class == Class::Heavy && need.lock != "none";
         let agent = format!("corral:{}:{}", need.id, need.attempt);
         if wants_lock && let Err(busy) = self.lock.acquire(&agent, "corral job", need.pid, self.cfg.lock_ttl_s) {
-            return Err(vec![reason("lock", busy.0)]);
+            return undo(vec![reason("lock", busy.0)]);
         }
-        // Second check, under the lock, and the reservation in the same critical section.
-        let mut st = self.st();
-        if let Err(why) = self.check(need, &st) {
+        // 3. Both checks again, while holding the lock (R-ADM-01): the guard's with its profile and the projection,
+        // then ours, with the reservation in the same critical section.
+        let release = |why: Vec<DeclineReason>| {
             if wants_lock {
                 self.lock.release(&agent);
             }
-            return Err(why);
+            undo(why)
+        };
+        if let Some(g) = &self.guard {
+            match g.admit(&name, need.ram_mb, need.class, 0, reservation.as_deref()) {
+                Ok(a) if a.ok => {}
+                Ok(a) => return release(a.reasons),
+                Err(e) => return release(vec![reason("guard", format!("guard unreachable: {e}"))]),
+            }
+        }
+        let mut st = self.st();
+        if let Err(why) = self.check(need, &st) {
+            return release(why);
         }
         let key = (need.id.clone(), need.attempt);
         st.running.insert(key.clone(), Entry { class: need.class, ram_mb: need.ram_mb, footprint_mb: 0 });
-        Ok(Ticket { key, agent: wants_lock.then_some(agent), lock: self.lock.clone(), st: self.st.clone() })
+        Ok(Ticket {
+            key,
+            agent: wants_lock.then_some(agent),
+            lock: self.lock.clone(),
+            st: self.st.clone(),
+            guard: self.guard.clone(),
+            reservation: Mutex::new(reservation),
+            reg_id: Mutex::new(None),
+        })
     }
 
     /// Keep the host lock alive (`ttl / 3`) while the attempt runs (R-LOCK-03).
@@ -242,6 +358,7 @@ impl Admitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hostguard::GuardReg;
     use crate::lock::FakeLock;
     use crate::testing::FakeMemory;
 
@@ -372,5 +489,86 @@ mod tests {
         let a = Admitter::new(AdmitConfig { ram_cap_mb: Some(1_000), ..cfg() }, FakeMemory::constant(64_000, 60_000), lock);
         assert_eq!(a.summary().1.admissible_ram_mb, 1_000);
         assert!(a.try_start(&need("j-1", 1_500)).is_err());
+    }
+
+    fn guarded(g: Arc<crate::hostguard::FakeGuard>) -> (Admitter, Arc<FakeLock>) {
+        let lock = Arc::new(FakeLock::default());
+        (Admitter::new(cfg(), FakeMemory::constant(10_000, 9_000), lock.clone()).with_guard(g), lock)
+    }
+
+    fn why(check: &str, text: &str) -> DeclineReason {
+        DeclineReason { check: check.into(), reason: text.into() }
+    }
+
+    /// R-ADM-01 / R-ADM-04 (M3): the guard's refusal reaches the job as its decline reasons, the lock is never
+    /// taken, and an unreachable guard fails closed.
+    #[test]
+    fn the_guards_refusal_is_the_declines_reason_and_unreachable_fails_closed() {
+        let g = crate::hostguard::FakeGuard::new();
+        let (a, lock) = guarded(g.clone());
+        *g.refuse.lock().unwrap() = vec![why("screen_unlocked", "locked since 10:00"), why("ac_power", "on battery")];
+        let e = a.try_start(&need("j-1", 100)).err().unwrap();
+        assert_eq!((e[0].check.as_str(), e.len()), ("screen_unlocked", 2));
+        assert!(lock.is_free() && lock.log.lock().unwrap().is_empty(), "refused before the lock was touched");
+        g.refuse.lock().unwrap().clear();
+        *g.down.lock().unwrap() = Some("no socket".into());
+        let e = a.try_start(&need("j-1", 100)).err().unwrap();
+        assert_eq!(e[0].check, "guard");
+        assert!(e[0].reason.contains("guard unreachable"));
+        assert!(!a.summary().1.heavy_ok, "an unreachable guard blocks claiming too");
+    }
+
+    /// R-ADM-01 (M3): a guard check that flips between admit and the lock declines, frees the lock and the reservation.
+    #[test]
+    fn the_guards_recheck_under_the_lock_declines_and_releases_everything() {
+        let g = crate::hostguard::FakeGuard::new();
+        let (a, lock) = guarded(g.clone());
+        *g.refuse_under_lock.lock().unwrap() = vec![why("user_idle", "idle 10s")];
+        let e = a.try_start(&need("j-1", 100)).err().unwrap();
+        assert_eq!(e[0].check, "user_idle");
+        assert!(lock.is_free(), "lock released");
+        assert!(g.calls().iter().any(|c| c == "unreserve tok-1"), "{:?}", g.calls());
+        assert!(a.running_ids().is_empty());
+    }
+
+    /// A started job is registered with the reservation, and dropping the ticket unregisters it.
+    #[test]
+    fn a_ticket_registers_with_the_guard_and_unregisters_on_drop() {
+        let g = crate::hostguard::FakeGuard::new();
+        let (a, _) = guarded(g.clone());
+        let t = a.try_start(&need("j-1", 100)).unwrap();
+        t.register_with_guard(GuardReg {
+            name: "corral:j-1:1".into(),
+            pid: 5,
+            pgid: 5,
+            pid_start: "s".into(),
+            tier: Some(0),
+            budget_mb: Some(100),
+            pausable: true,
+            heavy: true,
+            reservation: None,
+        })
+        .unwrap();
+        assert_eq!(g.registered.lock().unwrap()[0].reservation.as_deref(), Some("tok-1"), "the reservation is handed over");
+        drop(t);
+        let calls = g.calls();
+        assert!(calls.contains(&"unregister reg-corral:j-1:1".to_string()));
+        assert!(!calls.iter().any(|c| c.starts_with("unreserve")), "the reservation went with the registration: {calls:?}");
+    }
+
+    /// R-AWAKE-03: a required provider that fails refuses heavy work with `keepawake_unavailable`, not light work.
+    #[test]
+    fn a_required_keepawake_provider_that_fails_refuses_heavy_work() {
+        let ka = crate::keepawake::FakeKeepAwake::new();
+        let lock = Arc::new(FakeLock::default());
+        let a = Admitter::new(cfg(), FakeMemory::constant(10_000, 9_000), lock).with_keepawake(ka.clone(), true);
+        assert!(a.try_start(&need("j-1", 100)).is_ok());
+        let a = Admitter::new(cfg(), FakeMemory::constant(10_000, 9_000), Arc::new(FakeLock::default())).with_keepawake(ka.clone(), true);
+        ka.break_it("provider gone");
+        let e = a.try_start(&need("j-2", 100)).err().unwrap();
+        assert_eq!(e[0].check, "keepawake_unavailable");
+        let light = Need { class: Class::Light, ..need("j-3", 10) };
+        assert!(a.try_start(&light).is_ok());
+        assert!(a.summary().1.blocked.iter().any(|b| b.check == "keepawake_unavailable"));
     }
 }

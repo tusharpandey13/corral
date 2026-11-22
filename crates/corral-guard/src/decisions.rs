@@ -39,6 +39,10 @@ pub struct Decision {
     /// For `admit`: the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// In-process only (never logged): the key of the unit, or the name of the hook, this decision is about. Enforce
+    /// mode executes the decision against exactly that.
+    #[serde(skip)]
+    pub key: Option<String>,
 }
 
 impl Decision {
@@ -59,6 +63,7 @@ impl Decision {
             reason: reason.into(),
             detail: detail.into(),
             ok: None,
+            key: None,
         }
     }
 

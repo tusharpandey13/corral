@@ -125,6 +125,11 @@ pub struct WorkerCfg {
     pub env_passthrough: Vec<String>,
     /// `PATH` given to jobs.
     pub job_path: Option<String>,
+    /// Ask the local guard (GUARDS.md 6) for admission, register jobs with it and learn kills from it (M3). Default
+    /// `false`: the worker applies the `default` checks itself, as in M1. `guard.socket` (or `CORRAL_GUARD_SOCKET`)
+    /// names the socket.
+    #[serde(default)]
+    pub use_guard: bool,
 }
 
 /// Where the config came from, for `config check`.

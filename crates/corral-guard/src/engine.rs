@@ -27,6 +27,9 @@ pub struct EngineCfg {
     pub pause_max_thermal_ms: i64,
     pub budget_slack: f64,
     pub hooks: Vec<HookRef>,
+    /// Enforce mode: kills are really sent, so a unit that survives them is tried again after `retry_ms`.
+    pub enforce: bool,
+    pub retry_ms: i64,
 }
 
 pub struct Engine {
@@ -36,6 +39,7 @@ pub struct Engine {
     shed_wait_until: i64,
     /// Units the guard has decided to kill: key -> (episodic, since). Episodic ones are forgotten when the episode ends.
     dead: HashMap<String, bool>,
+    dead_at: HashMap<String, i64>,
     paused: HashMap<String, (i64, bool)>,
     noted: HashSet<String>,
     hooks_ran: HashSet<String>,
@@ -62,6 +66,7 @@ impl Engine {
             level: Level::Ok,
             shed_wait_until: 0,
             dead: HashMap::new(),
+            dead_at: HashMap::new(),
             paused: HashMap::new(),
             noted: HashSet::new(),
             hooks_ran: HashSet::new(),
@@ -101,6 +106,7 @@ impl Engine {
         d.unit = Some(u.reg_name.clone().unwrap_or_else(|| u.key.clone()));
         d.pids = u.pids.clone();
         d.comm = Some(u.comm.clone());
+        d.key = Some(u.key.clone());
         d
     }
 
@@ -113,9 +119,16 @@ impl Engine {
     fn hooks(&mut self, now: i64, on: &str, out: &mut Vec<Decision>) {
         for h in self.cfg.hooks.iter().filter(|h| h.on.iter().any(|x| x == on)) {
             if self.hooks_ran.insert(format!("{on}:{}", h.name)) || on == "shed" {
-                out.push(Decision::new(now, "would_hook", on, "restore_hook", format!("run restore hook {:?} (after {on})", h.name)));
+                let mut d = Decision::new(now, "would_hook", on, "restore_hook", format!("run restore hook {:?} (after {on})", h.name));
+                d.key = Some(h.name.clone());
+                out.push(d);
             }
         }
+    }
+
+    fn mark_dead(&mut self, key: &str, episodic: bool, now: i64) {
+        self.dead.insert(key.to_string(), episodic);
+        self.dead_at.insert(key.to_string(), now);
     }
 
     fn resume_ok(&self, s: &Sample) -> bool {
@@ -175,7 +188,18 @@ impl Engine {
             return out;
         };
         let live: HashSet<&str> = units.iter().map(|u| u.key.as_str()).collect();
+        if self.cfg.enforce {
+            // a unit still alive long after its kill was sent is tried again (the kill did not take)
+            let retry = self.cfg.retry_ms;
+            let stale: Vec<String> =
+                self.dead_at.iter().filter(|(k, at)| now - **at > retry && live.contains(k.as_str())).map(|(k, _)| k.clone()).collect();
+            for k in stale {
+                self.dead.remove(&k);
+                self.dead_at.remove(&k);
+            }
+        }
         self.dead.retain(|k, _| live.contains(k.as_str()));
+        self.dead_at.retain(|k, _| self.dead.contains_key(k));
         self.paused.retain(|k, _| live.contains(k.as_str()));
 
         // per-registration budgets, whatever the level (R-GUARD-06)
@@ -191,7 +215,7 @@ impl Engine {
                     "ram_exceeded",
                     format!("footprint {}MB > budget {b}MB x {}", u.footprint_mb, self.cfg.budget_slack),
                 ));
-                self.dead.insert(u.key.clone(), false);
+                self.mark_dead(&u.key, false, now);
                 self.paused.remove(&u.key);
             }
         }
@@ -224,7 +248,7 @@ impl Engine {
                         reason,
                         format!("{ctx}; every watched unit goes, protected included"),
                     ));
-                    self.dead.insert(u.key.clone(), true);
+                    self.mark_dead(&u.key, true, now);
                     self.paused.remove(&u.key);
                 }
             }
@@ -259,7 +283,7 @@ impl Engine {
                     if let Some(tier) = eligible.iter().map(|u| u.tier).min() {
                         let reason = reason_of(thermal);
                         for u in eligible.iter().filter(|u| u.tier == tier) {
-                            let assumed = if self.shed_wait_until > 0 {
+                            let assumed = if self.shed_wait_until > 0 && !self.cfg.enforce {
                                 "; assuming the previous tier's kill took effect (observe mode cannot confirm it)"
                             } else {
                                 ""
@@ -271,7 +295,7 @@ impl Engine {
                                 reason,
                                 format!("{ctx}; tier {tier} of the shed ladder{assumed}"),
                             ));
-                            self.dead.insert(u.key.clone(), true);
+                            self.mark_dead(&u.key, true, now);
                             self.paused.remove(&u.key);
                         }
                         self.shed_wait_until = now + self.cfg.settle_ms;
@@ -322,7 +346,7 @@ impl Engine {
                     reason_of(th),
                     format!("{ctx}; paused longer than pause_max, escalated to a kill"),
                 ));
-                self.dead.insert(key.clone(), true);
+                self.mark_dead(&key, true, now);
             }
             self.paused.remove(&key);
         }
@@ -353,6 +377,8 @@ pub mod tests {
             reg_name: None,
             leader: key.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(1),
             pids: vec![key.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(1)],
+            starts: vec![],
+            pgid: None,
             comm: "prog".into(),
             footprint_mb,
         }
@@ -367,6 +393,8 @@ pub mod tests {
                 pause_max_thermal_ms: 600_000,
                 budget_slack: 1.1,
                 hooks: vec![HookRef { name: "restore".into(), on: vec!["critical".into(), "stop".into()] }],
+                enforce: false,
+                retry_ms: 20_000,
             },
             LevelEval::new(LevelCfg::resolve(true, None).unwrap(), 3),
         )
@@ -531,6 +559,8 @@ pub mod tests {
                 pause_max_thermal_ms: 600_000,
                 budget_slack: 1.1,
                 hooks: vec![],
+                enforce: false,
+                retry_ms: 20_000,
             },
             LevelEval::new(LevelCfg::resolve(false, None).unwrap(), 3),
         );

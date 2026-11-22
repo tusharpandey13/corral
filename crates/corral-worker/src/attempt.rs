@@ -4,6 +4,7 @@
 //! group this worker started is signalled.
 
 use crate::admission::Ticket;
+use crate::hostguard::GuardReg;
 use crate::link::SchedLink;
 use crate::logs::LogPublisher;
 use crate::runtime::*;
@@ -36,6 +37,9 @@ pub struct AttemptFlags {
     pub seq_out: Arc<AtomicU64>,
     pub seq_err: Arc<AtomicU64>,
     pub seq_sys: Arc<AtomicU64>,
+    /// The host guard killed this attempt's unit, and why (set from the guard's event stream, R-GUARD-08).
+    pub guard_kill: Mutex<Option<KillReason>>,
+    pub guard_paused: AtomicBool,
 }
 
 impl AttemptFlags {
@@ -50,6 +54,8 @@ impl AttemptFlags {
             seq_out: Arc::new(AtomicU64::new(0)),
             seq_err: Arc::new(AtomicU64::new(0)),
             seq_sys: Arc::new(AtomicU64::new(0)),
+            guard_kill: Mutex::new(None),
+            guard_paused: AtomicBool::new(false),
         }
     }
     fn set_phase(&self, p: &'static str) {
@@ -93,7 +99,7 @@ pub fn classify(cause: Option<Cause>, exit: &ExitInfo, duration_s: u64, peak_mb:
         Some(Cause::Stale) => killed(&mut f, KillReason::StaleLease.as_str(), "the attempt's lease was revoked"),
         None => {
             if let Some(r) = exit.by_runtime {
-                killed(&mut f, r.as_str(), "stopped by the runtime");
+                killed(&mut f, r.as_str(), "stopped by the host guard or the runtime");
             } else if let Some(s) = exit.signal {
                 killed(&mut f, KillReason::ExternalSignal.as_str(), &format!("terminated by signal {s} that corral did not send"));
             } else if exit.code.is_none() {
@@ -278,6 +284,41 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
             },
         );
         sys_note(&run_dir, &format!("started pid {} in process group {}", info.pid, info.pgid));
+        // The guard watches the unit from now on: tier 0, pausable, budgeted by the declared RAM (R-GUARD-06).
+        let ram = self.ram_for(&job.spec);
+        if let Err(e) = ticket.register_with_guard(GuardReg {
+            name: format!("corral:{id}:{attempt}"),
+            pid: info.pid,
+            pgid: info.pgid,
+            pid_start: proc_start_for_guard(info.pid),
+            tier: Some(0),
+            budget_mb: Some(ram),
+            pausable: true,
+            heavy: job.spec.class == corral_proto::job::Class::Heavy,
+            reservation: None,
+        }) {
+            sys_note(
+                &run_dir,
+                &format!("the host guard did not take this job's registration ({e}); only the worker's own budget watchdog applies"),
+            );
+        }
+        // Keep the host awake while the job runs (R-AWAKE-01): a named hold bound to the job's pid, renewed by its own
+        // task, released on every exit path.
+        let mut hold = None;
+        if let Some(ka) = self.adm.keepawake() {
+            match crate::keepawake::HoldGuard::take(
+                ka,
+                crate::keepawake::job_owner(&id, attempt),
+                Duration::from_secs(job.spec.timeout_s),
+                Some(info.pid),
+                false,
+            )
+            .await
+            {
+                Ok(h) => hold = Some(h),
+                Err(e) => sys_note(&run_dir, &format!("no keep-awake hold ({e}); the host may sleep while this job runs")),
+            }
+        }
         self.send_event(&id, attempt, flags, AttemptEvent::Started { pid: info.pid, pgid: info.pgid }).await;
 
         // Log publishers and progress.
@@ -376,10 +417,27 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
                 }
             }
         };
-        let exit = exit.unwrap_or_else(|e| {
+        let mut exit = exit.unwrap_or_else(|e| {
             sys_note(&run_dir, &format!("lost track of the process: {e}"));
             ExitInfo { code: None, signal: Some(0), by_runtime: None }
         });
+        // A kill by the host guard carries its reason (R-GUARD-08). The guard announces before it signals, but the
+        // event travels on another connection: when the job died of a signal nobody in corral sent, wait briefly.
+        if cause.is_none() && exit.by_runtime.is_none() {
+            let mut waited = 0;
+            while self.adm.guard().is_some()
+                && exit.signal.is_some()
+                && flags.guard_kill.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+                && waited < 30
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                waited += 1;
+            }
+            exit.by_runtime = *flags.guard_kill.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(r) = exit.by_runtime {
+                sys_note(&run_dir, &format!("stopped by the host guard: {}", r.as_str()));
+            }
+        }
         let duration_s = started.elapsed().as_secs();
         let mut fin = classify(cause, &exit, duration_s, peak);
 
@@ -393,6 +451,10 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         }
         // The process is gone: free the slot and the host lock now; reporting follows.
         drop(renewer);
+        if let Some(mut h) = hold.take() {
+            // the provider is an external command: release it off the async threads
+            let _ = tokio::task::spawn_blocking(move || h.release()).await;
+        }
         drop(ticket);
 
         if cause == Some(Cause::Stale) {
@@ -492,6 +554,10 @@ async fn upload_artifacts(http_url: &str, path: &str, token: &str, file: &std::p
         }
     }
     "none".into()
+}
+
+fn proc_start_for_guard(pid: u32) -> String {
+    crate::probe::start_time_of(pid)
 }
 
 pub fn now_ms() -> i64 {

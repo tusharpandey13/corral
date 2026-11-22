@@ -53,6 +53,7 @@ pub struct GuardSettings {
     pub admit_max_c: f64,
     pub sensor: Option<(String, String)>,
     pub zone: Option<PathBuf>,
+    pub keepawake: Option<corral_proto::guardcfg::KeepAwakeCfg>,
 }
 
 fn is_root() -> bool {
@@ -86,11 +87,11 @@ impl GuardSettings {
 
     pub fn resolve(cfg: &Config, macos: bool) -> Result<GuardSettings, String> {
         let g: GuardCfg = cfg.guard.clone().unwrap_or_default();
-        match g.mode.as_deref().unwrap_or("observe") {
-            "observe" => {}
-            "enforce" => return Err("guard.mode = \"enforce\" is not available in this build (milestone M3); use \"observe\"".into()),
+        let observe = match g.mode.as_deref().unwrap_or("observe") {
+            "observe" => true,
+            "enforce" => false,
             o => return Err(format!("guard.mode: {o:?} is not observe or enforce")),
-        }
+        };
         let dur = |k: &str, v: &Option<String>, d: u64| -> Result<u64, String> {
             v.as_deref().map(|s| parse_duration_ms(s).map_err(|e| format!("guard.{k}: {e}"))).transpose().map(|o| o.unwrap_or(d))
         };
@@ -147,7 +148,7 @@ impl GuardSettings {
         Ok(GuardSettings {
             host: cfg.host.clone().unwrap_or_else(|| "host".into()),
             macos,
-            observe: true,
+            observe,
             sample_ms: dur("sample", &g.sample, 2_000)?.max(100),
             settle_ms: dur("settle", &g.settle, 8_000)?,
             kill_grace_ms: dur("kill_grace", &g.kill_grace, 8_000)?,
@@ -175,6 +176,7 @@ impl GuardSettings {
             never,
             hooks,
             locks,
+            keepawake: g.keepawake.clone(),
         })
     }
 
@@ -232,9 +234,11 @@ shed = { free_pct_at_most = 12 }
     }
 
     #[test]
-    fn enforce_is_refused_until_m3_and_bad_values_name_their_key() {
-        let e = GuardSettings::resolve(&cfg("[guard]\nmode = \"enforce\"\n"), true).err().unwrap();
-        assert!(e.contains("M3"), "{e}");
+    fn enforce_is_opt_in_and_bad_values_name_their_key() {
+        assert!(GuardSettings::resolve(&cfg(""), true).unwrap().observe, "observe is the default");
+        assert!(!GuardSettings::resolve(&cfg("[guard]\nmode = \"enforce\"\n"), true).unwrap().observe);
+        let e = GuardSettings::resolve(&cfg("[guard]\nmode = \"fire\"\n"), true).err().unwrap();
+        assert!(e.contains("guard.mode"), "{e}");
         let e = GuardSettings::resolve(&cfg("[guard]\nsample = \"fast\"\n"), true).err().unwrap();
         assert!(e.contains("guard.sample"), "{e}");
         let e = GuardSettings::resolve(&cfg("[[guard.matchers]]\nname = \"x\"\nselect = {}\ntier = 1\n"), true).err().unwrap();

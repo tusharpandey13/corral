@@ -1,12 +1,14 @@
-//! corral-guard: the per-host guard (GUARDS.md). Milestone M2: **observe mode only**. The guard samples the host,
-//! computes levels, resolves the processes it watches, answers admission requests, keeps the kill-switch state and
-//! the host-lock helpers, and logs every decision it *would* take. It never signals a process: there is no signalling
-//! code in this crate, and `tests/no_signals.rs` keeps it that way until enforce mode (M3) adds it deliberately.
+//! corral-guard: the per-host guard (GUARDS.md). The guard samples the host, computes levels, resolves the
+//! processes it watches, answers admission requests, keeps the kill-switch state and the host-lock helpers, and
+//! decides. In `observe` mode (the default) it only logs what it *would* do. In `enforce` mode (opt-in per host,
+//! M3) `enforce.rs` carries the decisions out: it is the only module with signalling code, and
+//! `tests/no_signals.rs` keeps it that way.
 
 pub mod admit;
 pub mod client;
 pub mod compare;
 pub mod decisions;
+pub mod enforce;
 pub mod engine;
 pub mod guard;
 pub mod levels;

@@ -1031,3 +1031,80 @@ changes nothing. Where the approved text was ambiguous or silent, M2 picked thes
     report when the guard kills a `corral run` command (nothing is killed in observe), per-unit cgroup freeze, the
     worker registering its jobs with the guard (M3), and the worker's own budget watchdog stays as it is.
 
+### 17.3 M3: macOS worker, guard enforcing, shims, keep-awake
+
+M3 turns the guard from observer to enforcer (opt-in per host), lets the worker use it, and adds keep-awake holds and the
+legacy shims. Where the approved text was ambiguous or silent, M3 picked these defaults. Notes 27, 28, 37, 38 and 40
+(M2) are superseded where they say "observe only" or "M3".
+
+41. **Enforce is opt-in and one module signals.** `guard.mode = "enforce"` is accepted; `observe` stays the default. The
+    engine still only plans. `crates/corral-guard/src/enforce.rs` is the only file with signalling code (`no_signals.rs`
+    now confines it there and checks that even the executor never kills by name or pattern). In enforce mode decisions
+    drop the `would_` prefix (`kill`, `pause`, `resume_unit`, `hook`) and are logged and broadcast **before** the signal,
+    so a worker hears the reason first; background results are logged as `kill_done` and `hook_done`.
+42. **Safety rules in the executor.** A pid is signalled only if it is in the planned unit and its start time *right now*
+    equals the one the sample recorded; a pid with no recorded start time is not signalled (fail closed). Never signalled:
+    pid 0 and 1, the guard, its own process group, any unit holding a `never` process. A whole process group is signalled
+    only when the unit is that group (`pgid == leader`, leader still verifies); otherwise per pid. TERM, then KILL after
+    `kill_grace` for the pids that still verify, on a background thread (the sampler never blocks). A unit still alive
+    `kill_grace + settle + 4 s` after its kill is tried again (observe's "assumed gone" is observe-only). Unknown
+    measurements fail closed: an unreadable process table decides nothing (`skipped`), and unreadable memory fails
+    admission.
+43. **Pauses are recorded.** `SIGSTOP` is written to `<state_dir>/paused.json` (pid and start time) before it is sent; a
+    guard that starts, or stops in order, continues every process in that file that is still the same process. A paused
+    unit that is killed leaves the file.
+44. **Hooks.** Restore hooks run on their own thread with a clean environment (`PATH` only), in their own process group,
+    ended at their `timeout` (R-GUARD-07); exit code and the last 300 characters of output are logged. `kill = "hook"`
+    and `kill = "cgroup"` matchers fall back to per-process signalling (a per-matcher hook command and `cgroup.kill` are
+    not built). Notifications and `on_takeover` hooks are still not run.
+45. **The kill switch acts at once.** In enforce mode `stop` runs a decision round itself instead of waiting for the next
+    sample. Admission slot counts follow the last sample, so a killed unit frees its slot at the next one (at most 2 s).
+46. **Keep-awake.** One provider ships: `hold-cli` (an external command, default `awake` on `PATH`, configured as
+    `[guard.keepawake] command`) plus `none`; `caffeinate` and `systemd-inhibit` are refused at start as not built.
+    Hold names are `corral:<job>:<attempt>` (per attempt, so an old attempt's late release cannot end a new attempt's
+    hold) and `corral:run:<name>`: everything starts with `corral:` and `holds --json`, which lists all owners, is
+    filtered by that prefix (GUARDS.md 8 said the provider listed only its own). Window `min(timeout, 2 h) + 10 min`,
+    renewed every 30 min by repeating `hold`, bound to the unit's pid, released on every exit path (and by the provider
+    when the pid dies or the window ends). `release --all` and killing by name are never used. The worker talks to the
+    provider directly (the guard need not be up); the guard offers the same through `hold` / `release_hold` / `holds`
+    for `corral run --hold` (default window 2 h 10 min). `[guard.keepawake] required_for = ["heavy"]` is the spelling of
+    GUARDS.md's `keepawake_required_for`: while the provider probe (`holds --json`, cached 15 s) fails, heavy work is
+    refused with `keepawake_unavailable` by the guard (`admit`, `checks`) and by the worker (decline and presence).
+47. **The worker asks the guard** (`[worker] use_guard = true`; default false keeps M1 behaviour). Admission order:
+    guard `admit` with a 600 s reservation (long enough for an input fetch) -> local checks -> host lock -> the guard
+    again with the reservation, then the local checks again, under the lock (R-ADM-01). A guard that cannot be reached
+    declines with check `guard` (fail closed) and blocks claiming. The guard's failing checks are the decline reasons and
+    the presence `blocked` list (with `since`), which is how a host-local wait reaches the job's waiting text (R-ADM-04,
+    the half M2 deferred). After start the job is registered (`corral:<job>:<attempt>`, tier 0 unless a matcher says
+    otherwise, pausable, budget = declared RAM, which the guard multiplies by `budget_slack`) and unregistered when the
+    ticket drops. A failed registration is noted in the job's system log and the worker's own watchdog still applies.
+    The worker follows the guard's `kill` events; a job that dies of a signal while the worker has a guard waits up to 3 s
+    for the event, and `finished.reason` is the guard's (`system_memory`, `thermal`, `kill_switch`, `ram_exceeded`),
+    never `external_signal` (R-GUARD-08). `presence.kill_switch` follows the `kill_switch_off` check. A pause notice is
+    tracked but does not stop the job's timeout clock.
+48. **macOS memory for the worker** is `hw.memsize` times `kern.memorystatus_level` (what jetsam uses); anything
+    unreadable or out of range is an error, so admission fails closed. Non-exclusive heavy jobs start under `nice -n 10
+    taskpolicy -b` on macOS (R-EXEC-04). **Escapees on macOS:** `ps` does not show another process's environment, so the
+    Linux `CORRAL_JOB_ID` tag scan cannot be ported; descendants that `setsid` are recorded by the 1 s ppid-walk samples
+    and by the guard's matchers, and a double fork inside one second can still escape (residual, M1 review item).
+    `phys_footprint` still needs a native call and stays RSS.
+49. **Run-as abstraction (owner scope change).** The native runtime starts jobs through a `Launcher` trait
+    (`SameUser` is the only implementation) and takes `HOME` from it; nothing assumes the job runs as the worker's user,
+    in the owner's checkout or in the owner's home. Approved job profiles (a command prefix, a dedicated runner user,
+    limits) are specified separately and are not implemented; a launcher for another uid will also have to take over
+    signalling, because this worker cannot signal another user's processes unprivileged.
+50. **Shims.** `corral shim <macos|linux> [--program NAME] admit [name]|stop|resume|status|watch`, plus
+    `corral guard status --legacy-output` and `corral guard await`. `admit` is `corral admit --name legacy:<name|?>
+    --class heavy --reserve 60s --legacy-output`; `stop` prints `heavy jobs killed; new ones blocked until: NAME
+    resume`; `resume` prints `resumed`; `status` prints the first line from GUARDS.md 10.2 (`?` for an unreadable value)
+    and `tier N: pids` for each tier, never units left out. The scripts installed under the legacy names belong to the
+    deployment, not to this repo; golden tests pin the output. `watch` is `guard await`: it blocks while the guard
+    answers and exits 1 after three missed looks.
+51. **`corral run`.** `--hold` takes the named hold bound to the command's pid. A command that dies of a signal the guard
+    sent (a `kill` decision for `run:<name>` within two minutes of the guard's clock) exits 125 and prints the reason.
+52. **Not in M3:** guard-held locks and `lock.*` socket ops (still `unavailable`; locks are lease files taken with
+    `corral lock` or by the worker), `on_takeover` hooks, flock locks (M4), the `measurement` and `gui` profiles (M4),
+    notifications, the `caffeinate` and `systemd-inhibit` providers, `cgroup.kill` and per-unit cgroup freeze, pause
+    accounting in job timeouts, per-job guard `tier` from the job spec, the scheduler's `admin kill_switch` forward to
+    guards, and the end-to-end and chaos rubric. **Switching a host to enforce** is a deployment step after the G0 week.
+

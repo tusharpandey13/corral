@@ -22,6 +22,20 @@ use tokio::task::JoinHandle;
 struct Registry(HashMap<(String, u32), Arc<AttemptFlags>>);
 
 impl Registry {
+    fn guard_event(&self, ev: &crate::hostguard::GuardEvent) {
+        let Some((job, attempt)) = ev.unit.as_deref().and_then(|u| u.strip_prefix("corral:")).and_then(|u| u.rsplit_once(':')) else {
+            return;
+        };
+        let Ok(attempt) = attempt.parse::<u32>() else { return };
+        let Some(f) = self.0.get(&(job.to_string(), attempt)) else { return };
+        match ev.kind.as_str() {
+            "kill" => *f.guard_kill.lock().unwrap_or_else(|e| e.into_inner()) = corral_proto::job::KillReason::parse(&ev.reason),
+            "pause" => f.guard_paused.store(true, Ordering::SeqCst),
+            "resume_unit" => f.guard_paused.store(false, Ordering::SeqCst),
+            _ => {}
+        }
+    }
+
     /// The attempt of `job` whose lease token is `token` (a control push must name the current lease).
     fn find(&self, job: &str, token: &str) -> Option<&Arc<AttemptFlags>> {
         self.0.iter().find(|((j, _), f)| j == job && f.token == token).map(|(_, f)| f)
@@ -171,6 +185,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
                 caps.push(c);
             }
         }
+        let kill_switch = admission.blocked.iter().any(|b| b.check == "kill_switch_off");
         Presence {
             v: PROTOCOL_VERSION,
             from: format!("worker:{}", self.st.host),
@@ -186,7 +201,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
             metrics: Metrics::default(),
             paused: self.adm.paused(),
             draining: self.adm.draining(),
-            kill_switch: false,
+            kill_switch,
             t: rfc3339(crate::attempt::now_ms()),
         }
     }
@@ -332,6 +347,24 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         }
     }
 
+    /// Follow the guard's action events on a thread of their own: a `kill` of `corral:<job>:<attempt>` tells that
+    /// attempt why it died (R-GUARD-08); a pause is noted. No-op without a guard.
+    pub fn watch_guard(self: &Arc<Self>) {
+        let Some(g) = self.adm.guard().cloned() else { return };
+        let me = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            g.watch(&mut |ev| {
+                let Some(w) = me.upgrade() else { return false };
+                w.on_guard_event(&ev);
+                true
+            });
+        });
+    }
+
+    pub fn on_guard_event(&self, ev: &crate::hostguard::GuardEvent) {
+        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).guard_event(ev);
+    }
+
     pub fn spawn_task(&self, t: JoinHandle<()>) {
         self.tasks.lock().unwrap_or_else(|e| e.into_inner()).push(t);
     }
@@ -347,6 +380,28 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-GUARD-08: a guard `kill` event names the attempt and its reason; another attempt of the job and other
+    /// event kinds do not touch it.
+    #[test]
+    fn guard_events_reach_only_the_named_attempt() {
+        use crate::hostguard::GuardEvent;
+        let ev = |kind: &str, unit: &str, reason: &str| GuardEvent {
+            kind: kind.into(),
+            unit: Some(unit.into()),
+            reason: reason.into(),
+            detail: String::new(),
+        };
+        let mut w = Registry::default();
+        let (a1, a2) = (Arc::new(AttemptFlags::new("t1")), Arc::new(AttemptFlags::new("t2")));
+        w.0.insert(("j:1".into(), 1), a1.clone());
+        w.0.insert(("j:1".into(), 2), a2.clone());
+        w.guard_event(&ev("kill", "corral:j:1:2", "system_memory"));
+        w.guard_event(&ev("level", "corral:j:1:1", "level_up"));
+        w.guard_event(&ev("kill", "run:other", "thermal"));
+        assert_eq!(*a2.guard_kill.lock().unwrap(), Some(corral_proto::job::KillReason::SystemMemory));
+        assert_eq!(*a1.guard_kill.lock().unwrap(), None);
+    }
 
     /// R-QUEUE-06 (M1 review): the registry keeps attempts of one job apart, and a control push must name the
     /// current lease token (`kill_stale` included).

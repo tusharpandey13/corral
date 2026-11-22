@@ -149,9 +149,9 @@ impl Report {
 
 fn candidate(kind: &LegacyKind, d: &Decision) -> bool {
     match kind {
-        LegacyKind::KillTier { tier } => d.kind == "would_kill" && d.tier == Some(*tier),
-        LegacyKind::KillAll => d.kind == "would_kill" && matches!(d.level.as_str(), "critical" | "stop"),
-        LegacyKind::Shed => d.kind == "would_kill" && d.level == "shed",
+        LegacyKind::KillTier { tier } => matches!(d.kind.as_str(), "would_kill" | "kill") && d.tier == Some(*tier),
+        LegacyKind::KillAll => matches!(d.kind.as_str(), "would_kill" | "kill") && matches!(d.level.as_str(), "critical" | "stop"),
+        LegacyKind::Shed => matches!(d.kind.as_str(), "would_kill" | "kill") && d.level == "shed",
         LegacyKind::ShedSkipped => d.kind == "skipped",
         LegacyKind::Stop => d.kind == "stop",
         LegacyKind::Resume => d.kind == "resume",
@@ -187,7 +187,7 @@ pub fn compare(legacy: &[LegacyEvent], unknown_lines: usize, ours: &[Decision], 
         .iter()
         .enumerate()
         .filter(|(i, d)| {
-            !used[*i] && matches!(d.kind.as_str(), "would_kill" | "stop" | "resume" | "skipped")
+            !used[*i] && matches!(d.kind.as_str(), "would_kill" | "kill" | "stop" | "resume" | "skipped")
                 || (!used[*i] && d.kind == "admit" && d.ok == Some(true))
         })
         .map(|(_, d)| d)

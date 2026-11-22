@@ -9,8 +9,8 @@ online **and has room**, runs them under guard, streams the logs back live, and 
 
 > **Status: early development.** The specs are approved and milestone **M1** (scheduler, NATS, Linux worker, CLI,
 > git and snapshot input, logs, events, artifacts) and **M2** (the guard in observe mode: it decides and logs, signals
-> nothing; plus `admit`, `run` and `lock`) are implemented. Nothing is released yet; guard enforcement, the
-> macOS worker, the measurement profiles and interactive leases are later milestones (`docs/SPEC.md` section 13).
+> nothing; plus `admit`, `run` and `lock`) and **M3** (guard enforce mode, opt-in per host; the macOS worker; keep-awake holds; shims for legacy guard scripts) are
+> implemented. Nothing is released yet; the measurement profiles and interactive leases are later milestones (`docs/SPEC.md` section 13).
 
 ---
 

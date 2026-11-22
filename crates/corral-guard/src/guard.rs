@@ -3,6 +3,7 @@
 
 use crate::admit::{self, AdmitReq, CheckResult, Class, Ctx, Reservation};
 use crate::decisions::{Decision, DecisionLog};
+use crate::enforce::{Executor, RealHooks, RealSys};
 use crate::engine::{Engine, EngineCfg, Tick};
 use crate::levels::{Level, LevelEval};
 use crate::procs::{ProcInfo, ProcSource, Protect, Rules, Unit, build_units};
@@ -10,6 +11,7 @@ use crate::sample::{DiskProbe, Probes, Sample, run_cmd_owned};
 use crate::settings::GuardSettings;
 use crate::state::{Registration, StateDir, StopState};
 use corral_proto::util::{random_b32, rfc3339};
+use corral_worker::keepawake::{CachedProbe, KeepAwake};
 use corral_worker::lock::{FileLock, LockStatus, LockStore, SystemWall};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -78,6 +80,10 @@ pub struct Guard {
     disk: Box<dyn DiskProbe>,
     resolver: Box<dyn ProtectResolver>,
     clock: Arc<dyn Clock>,
+    /// Enforce mode only: the one place that signals (`enforce.rs`).
+    exec: Option<Executor>,
+    /// The keep-awake provider, and whether heavy work requires it (R-AWAKE-03).
+    keepawake: Option<(Arc<dyn KeepAwake>, bool, CachedProbe)>,
     inner: Mutex<Inner>,
     events: broadcast::Sender<String>,
 }
@@ -98,6 +104,8 @@ impl Guard {
                 pause_max_thermal_ms: settings.pause_max_thermal_ms as i64,
                 budget_slack: settings.budget_slack,
                 hooks: settings.hook_refs(),
+                enforce: !settings.observe,
+                retry_ms: (settings.kill_grace_ms + settings.settle_ms) as i64 + 4_000,
             },
             eval,
         );
@@ -106,7 +114,21 @@ impl Guard {
         let now = deps.clock.now_ms();
         let regs = state.load_regs();
         let (events, _) = broadcast::channel(256);
+        let exec = (!settings.observe).then(|| {
+            Executor::new(Arc::new(RealSys), Arc::new(RealHooks), std::time::Duration::from_millis(settings.kill_grace_ms), state.path())
+        });
+        if let Some(x) = &exec {
+            // processes a previous run of this guard left stopped are continued
+            let n = x.resume_all_paused();
+            if n > 0 {
+                tracing::warn!("resumed {n} process(es) a previous guard run had paused");
+            }
+        }
+        let keepawake = corral_worker::keepawake::from_config(settings.keepawake.as_ref())?
+            .map(|(p, req)| (p.clone(), req, CachedProbe::new(p, std::time::Duration::from_secs(15))));
         Ok(Guard {
+            exec,
+            keepawake,
             inner: Mutex::new(Inner {
                 engine,
                 sample: Sample::default(),
@@ -129,6 +151,94 @@ impl Guard {
             clock: deps.clock,
             events,
         })
+    }
+
+    /// Replace the keep-awake provider (tests).
+    pub fn with_keepawake(mut self, p: Arc<dyn KeepAwake>, required: bool) -> Guard {
+        let probe = CachedProbe::new(p.clone(), std::time::Duration::from_millis(1));
+        self.keepawake = Some((p, required, probe));
+        self
+    }
+
+    /// `keepawake_ok` (GUARDS.md 7.1): the provider probe; `required` makes a failure refuse heavy work.
+    fn keepawake_check(&self) -> Option<(CheckResult, bool)> {
+        let (_, required, probe) = self.keepawake.as_ref()?;
+        Some(match probe.check() {
+            Ok(()) => (
+                CheckResult { check: "keepawake_ok".into(), ok: true, reason: "keep-awake provider works".into(), since_ms: None },
+                *required,
+            ),
+            Err(e) => (
+                CheckResult {
+                    check: "keepawake_unavailable".into(),
+                    ok: !*required,
+                    reason: format!("keep-awake provider unavailable: {e}"),
+                    since_ms: None,
+                },
+                *required,
+            ),
+        })
+    }
+
+    fn hold_op(&self, op: &str, req: &Value) -> Value {
+        let Some((p, _, _)) = &self.keepawake else {
+            return err("no keep-awake provider is configured ([guard.keepawake])");
+        };
+        let owner = req.get("owner").and_then(Value::as_str).unwrap_or("");
+        let res: Result<Value, String> = match op {
+            "hold" => {
+                let for_s = req.get("for_s").and_then(Value::as_u64).unwrap_or(0);
+                let bound = req.get("bound_pid").and_then(Value::as_u64).map(|p| p as u32);
+                let display = req.get("display").and_then(Value::as_bool).unwrap_or(false);
+                p.hold(owner, std::time::Duration::from_secs(for_s.max(1)), bound, display)
+                    .map(|h| json!({ "v": 1, "ok": true, "owner": h.owner, "pid": h.pid, "for_s": for_s }))
+            }
+            "release_hold" => p.release(owner).map(|()| json!({ "v": 1, "ok": true })),
+            _ => p.list().map(|l| {
+                json!({ "v": 1, "ok": true, "holds": l.iter().map(|h| json!({ "owner": h.owner, "until": h.until, "pid": h.pid, "bound_pid": h.bound_pid, "display": h.display })).collect::<Vec<_>>() })
+            }),
+        };
+        res.unwrap_or_else(err)
+    }
+
+    /// Replace the executor (tests inject fake system calls). Enforce mode only.
+    pub fn with_executor(mut self, e: Executor) -> Guard {
+        self.exec = (!self.settings.observe).then_some(e);
+        self
+    }
+
+    /// Orderly shutdown: continue anything this guard paused.
+    pub fn shutdown(&self) {
+        if let Some(x) = &self.exec {
+            x.resume_all_paused();
+        }
+    }
+
+    /// Kinds in enforce mode lose the `would_` prefix (decisions.rs).
+    fn relabel(&self, mut d: Decision) -> Decision {
+        if self.exec.is_some() {
+            d.kind = match d.kind.as_str() {
+                "would_kill" => "kill",
+                "would_pause" => "pause",
+                "would_resume" => "resume_unit",
+                "would_hook" => "hook",
+                o => o,
+            }
+            .into();
+        }
+        d
+    }
+
+    fn drain(&self, g: &mut Inner) {
+        if let Some(x) = &self.exec {
+            let out: Vec<Decision> = std::mem::take(&mut *x.outbox().lock().unwrap_or_else(|e| e.into_inner()));
+            for mut d in out {
+                if d.t_ms == 0 {
+                    d.t_ms = self.clock.now_ms();
+                }
+                self.record(g, d);
+            }
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -167,6 +277,7 @@ impl Guard {
         let now = sample.t_ms;
         let stop = self.state.stop();
         let mut g = self.lock();
+        self.drain(&mut g);
         g.metrics.samples += 1;
         g.reservations.retain(|r| r.until_ms > now);
         if let Some(t) = &table {
@@ -189,18 +300,41 @@ impl Guard {
         g.table_ok = units.is_some();
         g.units = units.unwrap_or_default();
         g.sample = sample;
+        if let Some(x) = &self.exec {
+            x.set_level(g.engine.level().name());
+        }
+        // Record (and broadcast) first, then act: a worker hears why its job is about to die before it dies.
+        let mut todo: Vec<(Decision, Option<Unit>)> = Vec::new();
         for d in decisions {
-            self.record(&mut g, d);
+            let d = self.record(&mut g, self.relabel(d));
+            let u = d.key.as_ref().and_then(|k| g.units.iter().find(|u| &u.key == k).cloned());
+            todo.push((d, u));
+        }
+        drop(g);
+        let Some(x) = &self.exec else { return };
+        for (d, u) in todo {
+            match (d.kind.as_str(), u) {
+                ("kill", Some(u)) => x.kill(now, &u, &d.reason),
+                ("pause", Some(u)) => x.pause(now, &u),
+                ("resume_unit", Some(u)) => x.resume(&u),
+                ("hook", _) => {
+                    if let Some(h) = self.settings.hooks.iter().find(|h| Some(&h.name) == d.key.as_ref()) {
+                        x.hook(now, h);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
-    fn record(&self, g: &mut Inner, d: Decision) {
+    fn record(&self, g: &mut Inner, d: Decision) -> Decision {
         let d = g.log.record(d);
         if d.is_action() {
             *g.metrics.actions.entry((d.kind.clone(), d.tier.map(|t| t.to_string()).unwrap_or_default(), d.reason.clone())).or_default() +=
                 1;
         }
         let _ = self.events.send(serde_json::to_string(&d).expect("json"));
+        d
     }
 
     fn annotate(g: &mut Inner, now: i64, results: &mut [CheckResult]) {
@@ -248,6 +382,12 @@ impl Guard {
         let mut g = self.lock();
         g.reservations.retain(|r| r.until_ms > now);
         let mut results = self.with_ctx(&g, now, |c| admit::default_profile(c, &req));
+        if req.class == Class::Heavy
+            && let Some((r, _)) = self.keepawake_check()
+            && !r.ok
+        {
+            results.push(r);
+        }
         Self::annotate(&mut g, now, &mut results);
         let failing: Vec<&CheckResult> = results.iter().filter(|r| !r.ok).collect();
         let ok = failing.is_empty();
@@ -291,6 +431,9 @@ impl Guard {
             }),
             Some(p) => return err(format!("profile {p:?} is not available in this build (default or all)")),
         };
+        if let Some((r, _)) = self.keepawake_check() {
+            results.push(r);
+        }
         for (name, l) in &self.settings.locks {
             let lock = FileLock::new(l.path.clone(), Arc::new(SystemWall));
             let holder = lock.holder();
@@ -360,9 +503,13 @@ impl Guard {
             "stop",
             g.engine.level().name(),
             "kill_switch",
-            format!(
-                "kill switch on by {by}: {reason}; admission refused. Observe mode: nothing is signalled, the next samples log what would be killed"
-            ),
+            if self.settings.observe {
+                format!(
+                    "kill switch on by {by}: {reason}; admission refused. Observe mode: nothing is signalled, the next samples log what would be killed"
+                )
+            } else {
+                format!("kill switch on by {by}: {reason}; admission refused; every watched non-never unit is being stopped")
+            },
         );
         self.record(&mut g, d);
         json!({ "v": 1, "ok": true, "mode": self.mode(), "observed": self.settings.observe, "note": if self.settings.observe { "observe mode: state recorded, no process is signalled" } else { "" } })
@@ -454,19 +601,28 @@ impl Guard {
                 self.lock().reservations.retain(|r| Some(r.token.as_str()) != s("token"));
                 json!({ "v": 1, "ok": true })
             }
-            "status" => self.status(),
+            "status" => {
+                self.drain(&mut self.lock());
+                self.status()
+            }
             "explain" => {
                 let n = req.get("n").and_then(Value::as_u64).unwrap_or(20) as usize;
-                json!({ "v": 1, "ok": true, "decisions": self.lock().log.last(n, false) })
+                json!({ "v": 1, "ok": true, "now_ms": self.clock.now_ms(), "decisions": self.lock().log.last(n, false) })
             }
-            "stop" => self.stop(s("by").unwrap_or("cli"), s("reason").unwrap_or("no reason given")),
+            "stop" => {
+                let r = self.stop(s("by").unwrap_or("cli"), s("reason").unwrap_or("no reason given"));
+                if self.exec.is_some() && r["ok"] == json!(true) {
+                    self.tick(); // the kill switch acts now, not at the next sample
+                }
+                r
+            }
             "resume" => self.resume(s("by").unwrap_or("cli")),
             "metrics" => json!({ "v": 1, "ok": true, "text": self.metrics() }),
             "lock.status" => json!({ "v": 1, "ok": true, "locks": self.lock_status(s("lock")) }),
             "lock.acquire" | "lock.renew" | "lock.release" => {
                 err("unavailable: take host locks with `corral lock` (the lease-file protocol); guard-held locks arrive with milestone M3")
             }
-            "hold" | "release_hold" | "holds" => err("unavailable: keep-awake holds arrive with milestone M3"),
+            op @ ("hold" | "release_hold" | "holds") => self.hold_op(op, req),
             "subscribe" => err("subscribe is a streaming request"),
             other => err(format!("unknown op {other:?}")),
         }

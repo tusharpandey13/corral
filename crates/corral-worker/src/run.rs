@@ -20,7 +20,19 @@ pub async fn start<R: Runtime>(
     lock: Arc<dyn LockStore>,
     rt: Arc<R>,
 ) -> Result<Arc<Worker<NatsLink, R>>, String> {
-    let adm = Arc::new(Admitter::new(
+    start_with(settings, bus, mem, lock, rt, |a| a).await
+}
+
+/// `start`, with a hook to add the host guard and the keep-awake provider to the admitter.
+pub async fn start_with<R: Runtime>(
+    settings: WorkerSettings,
+    bus: Bus,
+    mem: Arc<dyn MemoryProbe>,
+    lock: Arc<dyn LockStore>,
+    rt: Arc<R>,
+    wire: impl FnOnce(Admitter) -> Admitter,
+) -> Result<Arc<Worker<NatsLink, R>>, String> {
+    let adm = Arc::new(wire(Admitter::new(
         AdmitConfig {
             heavy_slots: settings.heavy_slots,
             light_slots: settings.light_slots,
@@ -30,7 +42,7 @@ pub async fn start<R: Runtime>(
         },
         mem,
         lock,
-    ));
+    )));
     let host = settings.host.clone();
     let link = Arc::new(NatsLink { bus: bus.clone(), host: host.clone() });
     let worker = Worker::new(link, rt, adm, Arc::new(settings));
@@ -58,5 +70,6 @@ pub async fn start<R: Runtime>(
         }));
     }
     worker.spawn_loops();
+    worker.watch_guard();
     Ok(worker)
 }

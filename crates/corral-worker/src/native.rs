@@ -14,7 +14,55 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::process::{Child, Command};
 
+/// Everything needed to launch one job process, independent of who it runs as.
+pub struct LaunchSpec<'a> {
+    pub argv: &'a [String],
+    pub workdir: &'a Path,
+    pub env: Vec<(String, String)>,
+    /// Low CPU priority (non-exclusive heavy jobs, R-EXEC-04).
+    pub background: bool,
+}
+
+/// How a job process is launched: the run-as abstraction. The runtime asks a launcher for the `Command` and never
+/// assumes the job runs as the worker's user, in the worker's home or in any checkout of the owner. `SameUser` is
+/// the only implementation of M3; a launcher that starts the job as another (runner) user belongs to the job-profile
+/// work and must also take over signalling, which a different uid cannot receive from this worker unprivileged.
+pub trait Launcher: Send + Sync {
+    /// The command that starts the job in its own process group (the runtime sets `process_group(0)` and stdio).
+    fn command(&self, spec: &LaunchSpec<'_>) -> Command;
+    /// The `HOME` the job sees.
+    fn home(&self) -> String;
+}
+
+/// Runs the job as the worker's own user.
+pub struct SameUser;
+
+impl Launcher for SameUser {
+    fn command(&self, spec: &LaunchSpec<'_>) -> Command {
+        // The wrappers exec the command, so the pid is the job's. macOS: `taskpolicy -b` = background QoS.
+        let mut c = if spec.background {
+            let mut c = Command::new("nice");
+            c.args(["-n", "10"]);
+            if cfg!(target_os = "macos") {
+                c.args(["taskpolicy", "-b"]);
+            }
+            c.args(spec.argv);
+            c
+        } else {
+            let mut c = Command::new(&spec.argv[0]);
+            c.args(&spec.argv[1..]);
+            c
+        };
+        c.current_dir(spec.workdir).env_clear().envs(spec.env.iter().cloned());
+        c
+    }
+    fn home(&self) -> String {
+        std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    }
+}
+
 pub struct NativeRuntime {
+    launcher: Arc<dyn Launcher>,
     work_dir: PathBuf,
     job_path: String,
     env_passthrough: Vec<String>,
@@ -41,7 +89,12 @@ pub struct NativeRunning {
 
 impl NativeRuntime {
     pub fn new(work_dir: PathBuf, job_path: String, env_passthrough: Vec<String>) -> NativeRuntime {
-        NativeRuntime { work_dir, job_path, env_passthrough, table: Arc::new(PsTable) }
+        NativeRuntime { launcher: Arc::new(SameUser), work_dir, job_path, env_passthrough, table: Arc::new(PsTable) }
+    }
+
+    pub fn with_launcher(mut self, l: Arc<dyn Launcher>) -> NativeRuntime {
+        self.launcher = l;
+        self
     }
 
     pub fn with_table(mut self, t: Arc<dyn ProcessTable>) -> NativeRuntime {
@@ -50,7 +103,7 @@ impl NativeRuntime {
     }
 
     fn env_for(&self, ctx: &AttemptCtx) -> Vec<(String, String)> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+        let home = self.launcher.home();
         let mut env: Vec<(String, String)> = vec![
             ("PATH".into(), self.job_path.clone()),
             ("HOME".into(), home),
@@ -183,24 +236,10 @@ impl Runtime for NativeRuntime {
         let open = |p: &Path| std::fs::File::create(p).map_err(|e| RuntimeError::Other(format!("{}: {e}", p.display())));
         let (fo, fe) = (open(&out)?, open(&err)?);
         let cmd = &ctx.spec.cmd;
-        // Non-exclusive jobs run at low CPU priority (R-EXEC-04). `nice` execs the command, so the pid is the job's.
-        let mut c = if !ctx.spec.exclusive && ctx.spec.class == Class::Heavy {
-            let mut c = Command::new("nice");
-            c.args(["-n", "10"]).args(cmd);
-            c
-        } else {
-            let mut c = Command::new(&cmd[0]);
-            c.args(&cmd[1..]);
-            c
-        };
-        c.current_dir(&p.workdir)
-            .env_clear()
-            .envs(self.env_for(ctx))
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(fo))
-            .stderr(Stdio::from(fe))
-            .process_group(0)
-            .kill_on_drop(false);
+        // Non-exclusive heavy jobs run at low priority (R-EXEC-04).
+        let background = !ctx.spec.exclusive && ctx.spec.class == Class::Heavy;
+        let mut c = self.launcher.command(&LaunchSpec { argv: cmd, workdir: &p.workdir, env: self.env_for(ctx), background });
+        c.stdin(Stdio::null()).stdout(Stdio::from(fo)).stderr(Stdio::from(fe)).process_group(0).kill_on_drop(false);
         let child = c.spawn().map_err(|e| RuntimeError::Spawn(format!("{}: {e}", cmd[0])))?;
         let pid = child.id().ok_or_else(|| RuntimeError::Spawn("child exited before it could be tracked".into()))?;
         let tag = vec![format!("CORRAL_JOB_ID={}", ctx.job_id), format!("CORRAL_ATTEMPT={}", ctx.attempt)];

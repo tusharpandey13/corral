@@ -336,12 +336,12 @@ trait KeepAwake {
     fn probe(&self) -> Result<(), Reason>;                                 // available and working?
     fn hold(&self, owner: &HoldName, dur: Duration, bound_pid: Option<Pid>, display: bool) -> Result<HoldInfo>;
     fn release(&self, owner: &HoldName) -> Result<()>;                      // idempotent
-    fn list(&self) -> Result<Vec<HoldInfo>>;                                // only holds this provider created
+    fn list(&self) -> Result<Vec<HoldInfo>>;                                // only corral's holds: the provider lists every owner's, corral keeps the `corral:` prefix
 }
 ```
 
 Contract for every provider:
-- Holds are **named** (`corral:<job or lease id>`, `corral-run:<name>`), **time-bounded** (expire by themselves even if
+- Holds are **named** (`corral:<job id>:<attempt>` for jobs and leases, `corral:run:<name>` for `corral run`: every name starts with `corral:`, which is how corral tells its holds from anyone else's), **time-bounded** (expire by themselves even if
   corral and every state file vanish), renewable without a gap (start the new hold, then end the old), and optionally
   bound to a pid.
 - A hold never reads, changes or ends a keep-awake **session** the user started, and never changes lock-screen,
@@ -352,7 +352,7 @@ Contract for every provider:
 
 | Provider | OS | Mechanism |
 |---|---|---|
-| `hold-cli` | macOS (any) | an external command implementing the hold contract: `hold --for D --owner N [--pid P] [--display]`, `release --owner N`, `holds --json` (e.g. a keep-awake script extended with named holds). Called by absolute path (service PATHs are minimal). |
+| `hold-cli` | macOS (any) | an external command implementing the hold contract: `hold --for D --owner N [--pid P] [--display]` (repeating it renews; prints `hold N until T (pid P)`), `release --owner N` (idempotent, exit 0 with no hold), `holds --json` (`[{owner, until, pid, started, display, bound_pid}]`, epoch seconds, **every** owner's holds). Exit codes: 0 ok, 1 provider failure (caffeinate, state or lock), 2 usage error, duration over the provider's maximum, or a dead `--pid`. corral never uses `release --all`. The command is configured (`command`, default `awake` on `PATH`); service environments have a minimal `PATH`, so deployments give an absolute path. |
 | `caffeinate` | macOS | corral starts `caffeinate -i -s [-d] -t <secs> [-w <pid>]` itself, records pid + start time, terminates only that pid on release |
 | `systemd-inhibit` | Linux | `systemd-inhibit --what=idle:sleep --who=corral --why=<name> --mode=block sleep <secs>` as a recorded child |
 | `none` | any | always-on servers |
@@ -365,7 +365,7 @@ work is refused with `keepawake_unavailable` (R-AWAKE-03).
 
 ```toml
 [guard]
-mode = "enforce"               # enforce | observe (log decisions, signal nothing: R-GUARD-10)
+mode = "enforce"               # enforce | observe (log decisions, signal nothing: R-GUARD-10). Observe is the default; enforce is opt-in per host
 sample = "2s"
 socket = "/run/corral/guard.sock"     # default: the runtime directory (§6)
 pause_max = "60s"; pause_max_thermal = "10m"; clear_samples = 3
@@ -424,7 +424,8 @@ kind = "flock"; path = "/home/user/.local/state/example-queue/device.lock"
 holder_file = "/home/user/.local/state/example-queue/device.holder.json"
 
 [guard.keepawake]
-provider = "hold-cli"; command = "/usr/local/bin/awake"
+provider = "hold-cli"; command = "/usr/local/bin/awake"   # command defaults to `awake` on PATH
+required_for = ["heavy"]       # optional: heavy work is refused (keepawake_unavailable) while the provider probe fails
 ```
 
 ## 10. Migration from the one-off scripts
@@ -443,7 +444,7 @@ provider = "hold-cli"; command = "/usr/local/bin/awake"
 
 ### 10.2 Shims (R-MIG-01)
 
-A shim is a small script installed under the legacy name, keeping CLI, output and exit codes:
+A shim is a small script installed under the legacy name, keeping CLI, output and exit codes. The scripts call `corral shim <macos|linux> [--program NAME] <admit [name]|stop|resume|status|watch>`, which prints the legacy shapes below (the table shows the equivalent long form):
 
 | Legacy call | Shim does | Output / exit |
 |---|---|---|

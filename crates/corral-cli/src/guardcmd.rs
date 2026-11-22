@@ -1,6 +1,6 @@
 //! `corral guard ...` and `corral admit`: thin clients of the local guard socket (GUARDS.md 4.1, 6, 7.5).
 
-use crate::args::{AdmitArgs, GuardCmd};
+use crate::args::{AdmitArgs, GuardCmd, ShimArgs, ShimCmd};
 use crate::exitcode;
 use corral_guard::client::{ClientError, request};
 use corral_guard::compare::{compare, parse_legacy};
@@ -156,6 +156,119 @@ pub fn status_text(s: &Value) -> String {
     o
 }
 
+/// The legacy guard script's `status` shape (GUARDS.md 10.2): one signals line, then `tier N: pids` per tier.
+pub fn legacy_status_text(s: &Value, flavor: &str) -> String {
+    let sm = &s["sample"];
+    let n = |k: &str, prec: usize| sm[k].as_f64().map(|v| format!("{v:.prec$}")).unwrap_or_else(|| "?".into());
+    let stop = if s["kill_switch"].is_object() { "ON" } else { "off" };
+    let mut o = if flavor == "linux" {
+        format!("avail={}MB temp={}C stop={stop}\n", n("avail_mb", 0), n("temp_c", 0))
+    } else {
+        format!("free={}% pressure={} swap={}MB stop={stop}\n", n("free_pct", 0), n("pressure", 0), n("swap_mb", 0))
+    };
+    let mut tiers: std::collections::BTreeMap<u64, Vec<u64>> = Default::default();
+    for u in s["units"].as_array().into_iter().flatten().filter(|u| u["never"] != json!(true)) {
+        tiers
+            .entry(u["tier"].as_u64().unwrap_or(0))
+            .or_default()
+            .extend(u["pids"].as_array().into_iter().flatten().filter_map(Value::as_u64));
+    }
+    for (t, mut pids) in tiers {
+        pids.sort_unstable();
+        pids.dedup();
+        o.push_str(&format!("tier {t}: {}\n", pids.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")));
+    }
+    o
+}
+
+/// `corral guard await`: 0 is never returned while the guard lives; exit 1 once it has been unreachable three looks
+/// in a row (a restart takes less).
+fn await_guard(sock: &std::path::Path, interval: &str) -> i32 {
+    let every = match parse_duration_ms(interval) {
+        Ok(ms) => std::time::Duration::from_millis(ms.max(100)),
+        Err(e) => {
+            eprintln!("corral: --interval: {e}");
+            return exitcode::USAGE;
+        }
+    };
+    let mut misses = 0;
+    loop {
+        match request(sock, "status", json!({})) {
+            Ok(_) => misses = 0,
+            Err(_) => {
+                misses += 1;
+                if misses >= 3 {
+                    eprintln!("corral: the guard is gone");
+                    return 1;
+                }
+            }
+        }
+        std::thread::sleep(every);
+    }
+}
+
+/// `corral shim FLAVOR CMD`: the legacy guard CLI on corral (R-MIG-01).
+pub fn shim_cmd(a: ShimArgs, cfg: &Config) -> i32 {
+    match a.cmd {
+        ShimCmd::Admit { name } => admit_cmd(
+            AdmitArgs {
+                name: Some(format!("legacy:{}", name.as_deref().filter(|n| !n.is_empty()).unwrap_or("?"))),
+                class: "heavy".into(),
+                reserve: Some("60s".into()),
+                legacy_output: true,
+                ..AdmitArgs::default()
+            },
+            cfg,
+        ),
+        ShimCmd::Stop => {
+            let sock = match socket_path(cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("corral: {e}");
+                    return exitcode::USAGE;
+                }
+            };
+            match request(&sock, "stop", json!({ "by": "legacy-cli", "reason": "legacy stop" })) {
+                Ok(r) => match reply_error(&r) {
+                    Some(c) => c,
+                    None => {
+                        println!("heavy jobs killed; new ones blocked until: {} resume", a.program);
+                        0
+                    }
+                },
+                Err(e) => {
+                    eprintln!("corral: {e}");
+                    1
+                }
+            }
+        }
+        ShimCmd::Resume => guard_cmd(GuardCmd::Resume { by: Some("legacy-cli".into()) }, cfg),
+        ShimCmd::Status => {
+            let sock = match socket_path(cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("corral: {e}");
+                    return exitcode::USAGE;
+                }
+            };
+            match request(&sock, "status", json!({})) {
+                Ok(r) => match reply_error(&r) {
+                    Some(c) => c,
+                    None => {
+                        print!("{}", legacy_status_text(&r, &a.flavor));
+                        0
+                    }
+                },
+                Err(e) => {
+                    eprintln!("corral: {e}");
+                    1
+                }
+            }
+        }
+        ShimCmd::Watch => guard_cmd(GuardCmd::Await { interval: "5s".into() }, cfg),
+    }
+}
+
 fn decision_line(d: &Value) -> String {
     let tier = d["tier"].as_u64().map(|t| format!(" tier {t}")).unwrap_or_default();
     let pids = d["pids"].as_array().filter(|p| !p.is_empty()).map(|p| format!(" pids {}", Value::Array(p.clone()))).unwrap_or_default();
@@ -188,9 +301,11 @@ pub fn guard_cmd(cmd: GuardCmd, cfg: &Config) -> i32 {
     };
     match cmd {
         GuardCmd::Run => unreachable!("handled by main"),
-        GuardCmd::Status { json } => match call("status", json!({})) {
+        GuardCmd::Status { json, legacy_output } => match call("status", json!({})) {
             Ok(r) => {
-                if json {
+                if legacy_output {
+                    print!("{}", legacy_status_text(&r, if cfg!(target_os = "macos") { "macos" } else { "linux" }));
+                } else if json {
                     println!("{}", serde_json::to_string_pretty(&r).expect("json"));
                 } else {
                     print!("{}", status_text(&r));
@@ -238,6 +353,7 @@ pub fn guard_cmd(cmd: GuardCmd, cfg: &Config) -> i32 {
             }
             Err(c) => c,
         },
+        GuardCmd::Await { interval } => await_guard(&sock, &interval),
         GuardCmd::Compare { legacy, ours, window, utc_offset, json } => compare_cmd(cfg, &legacy, ours, window, utc_offset, json),
     }
 }
