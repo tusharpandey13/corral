@@ -151,6 +151,11 @@ behaviour lives in the companion documents named per group.
 - **R-SCHED-05** At most `heavy_slots` (default 1) heavy jobs run per host, counting corral jobs and every live heavy
   process the guard sees. **AC:** with a matched non-corral heavy process alive, the worker's summary reports
   `heavy_ok=false` with that process named; no claim.
+- **R-SCHED-05a** (proposed, Q14) A worker on a host with a single spinning disk may declare `io_heavy` jobs and an
+  `io_slots` cap (default: equal to `heavy_slots`), so that IO-bound jobs (large git, search or install trees) do not
+  run in parallel and starve interactive sessions that share the disk. **AC:** with `io_slots = 1` and one `io_heavy`
+  job running, a second `io_heavy` job is not claimed (`declines_total{reason="io_slots"}`); a non-`io_heavy` light job
+  is.
 - **R-SCHED-06** Each claim is a single SQLite `BEGIN IMMEDIATE` transaction; two concurrent claims never receive the
   same job. **AC:** 50 parallel claims against 10 jobs: 10 distinct winners.
 
@@ -694,3 +699,5 @@ working tree; keep-awake holds; a queue that tolerates workers offline for days.
 - **Q11. Notification backend default:** proposed `ntfy` on `server`, `macos` local notifications on laptops.
 - **Q12. Crate layout** change vs `AGENTS.md` (adds `corral-guard`, `corral-runtime`): approve to update `AGENTS.md`.
 - **Q13. Phase-2 budget model:** monthly cap per owner vs per-job cap only (RUNTIMES.md §4).
+- **Q14. IO-heavy concurrency cap:** is an `io_heavy` flag plus `io_slots` (R-SCHED-05a) the right shape, or should it be a
+  generic named-resource slot (`slots = { heavy = 1, light = 2, io = 1 }`)? Proposed: generic named slots.
