@@ -18,8 +18,7 @@ pub struct ProcMeminfo;
 
 impl MemoryProbe for ProcMeminfo {
     fn read(&self) -> Result<MemInfo, String> {
-        let text = std::fs::read_to_string("/proc/meminfo")
-            .map_err(|e| format!("cannot read /proc/meminfo: {e} (the macOS memory probe arrives with milestone M3)"))?;
+        let text = std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("cannot read /proc/meminfo: {e}"))?;
         let field = |name: &str| -> Option<u64> {
             text.lines().find_map(|l| {
                 let rest = l.strip_prefix(name)?.strip_prefix(':')?;
@@ -30,6 +29,39 @@ impl MemoryProbe for ProcMeminfo {
         let avail = field("MemAvailable").ok_or("MemAvailable missing")?;
         Ok(MemInfo { total_mb: total / 1024, available_mb: avail / 1024 })
     }
+}
+
+/// macOS: `kern.memorystatus_level` is the free-memory percentage jetsam itself uses (GUARDS.md 2.1), so the
+/// available memory is that share of `hw.memsize`. Unreadable or out-of-range values are errors (fail closed).
+pub struct MacMemory;
+
+pub fn mac_mem_from(memsize: &str, level: &str) -> Result<MemInfo, String> {
+    let bytes: u64 = memsize.trim().parse().map_err(|_| format!("hw.memsize: {:?} is not a number", memsize.trim()))?;
+    let pct: u64 = level.trim().parse().map_err(|_| format!("kern.memorystatus_level: {:?} is not a number", level.trim()))?;
+    if bytes == 0 || pct > 100 {
+        return Err(format!("implausible memory reading (memsize {bytes}, free level {pct}%)"));
+    }
+    let total_mb = bytes / 1_048_576;
+    Ok(MemInfo { total_mb, available_mb: total_mb * pct / 100 })
+}
+
+fn sysctl(name: &str) -> Result<String, String> {
+    let o = Command::new("sysctl").args(["-n", name]).output().map_err(|e| format!("sysctl {name}: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("sysctl {name} failed"));
+    }
+    Ok(String::from_utf8_lossy(&o.stdout).to_string())
+}
+
+impl MemoryProbe for MacMemory {
+    fn read(&self) -> Result<MemInfo, String> {
+        mac_mem_from(&sysctl("hw.memsize")?, &sysctl("kern.memorystatus_level")?)
+    }
+}
+
+/// The memory probe of this host: macOS `sysctl`, else `/proc/meminfo`.
+pub fn host_memory() -> std::sync::Arc<dyn MemoryProbe> {
+    if cfg!(target_os = "macos") { std::sync::Arc::new(MacMemory) } else { std::sync::Arc::new(ProcMeminfo) }
 }
 
 /// One row of `ps`.
@@ -182,6 +214,23 @@ pub fn footprint_mb(members: &[Proc]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M3: the macOS probe turns jetsam's free percentage into available MB and refuses nonsense (fail closed).
+    #[test]
+    fn mac_memory_reading() {
+        let m = mac_mem_from("17179869184\n", "37\n").unwrap();
+        assert_eq!((m.total_mb, m.available_mb), (16384, 6062));
+        for bad in [("x", "37"), ("17179869184", ""), ("17179869184", "101"), ("0", "10")] {
+            assert!(mac_mem_from(bad.0, bad.1).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The real probes answer on this host (read-only calls).
+    #[test]
+    fn host_probes_answer_here() {
+        let m = host_memory().read().expect("memory probe");
+        assert!(m.total_mb > 0 && m.available_mb <= m.total_mb);
+    }
 
     struct Tagged(Vec<Proc>, Vec<u32>);
     impl ProcessTable for Tagged {

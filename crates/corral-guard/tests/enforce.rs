@@ -123,3 +123,67 @@ fn an_unreadable_process_table_kills_nothing() {
     rig.tick();
     assert!(rig.decisions().iter().all(|d| d.kind != "kill"));
 }
+
+/// The worker's socket client against a real guard server: admit with a reservation and the re-check under it,
+/// registration, and the kill event naming the registered unit (R-GUARD-08), all over the socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_worker_socket_client_talks_to_a_real_guard() {
+    use corral_worker::hostguard::{GuardReg, HostGuard};
+    let rig = Rig::enforcing("");
+    rig.tick();
+    let g = rig.guard.clone();
+    let server = tokio::spawn(corral_guard::server::serve(g, std::future::pending::<()>()));
+    for _ in 0..50 {
+        if rig.socket().exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let sock = rig.socket();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let (s, ev) = (sock.clone(), events.clone());
+        std::thread::spawn(move || {
+            corral_guard::client::SocketGuard { socket: s }.watch(&mut |e| {
+                ev.lock().unwrap().push(e);
+                true
+            })
+        });
+    }
+    let mut hog =
+        Command::new("perl").args(["-e", "$x = 'a' x (60*1024*1024); sleep 60"]).process_group(0).stdout(Stdio::null()).spawn().unwrap();
+    let (pid, s2) = (hog.id(), sock.clone());
+    let reg_id = tokio::task::spawn_blocking(move || {
+        let sg = corral_guard::client::SocketGuard { socket: s2 };
+        let a = sg.admit("corral:j-9:1", 20, corral_proto::job::Class::Heavy, 60, None).unwrap();
+        assert!(a.ok, "{a:?}");
+        let again = sg.admit("corral:j-9:1", 20, corral_proto::job::Class::Heavy, 0, a.reservation.as_deref()).unwrap();
+        assert!(again.ok, "the re-check under the lock sees its own reservation as free: {again:?}");
+        std::thread::sleep(Duration::from_millis(800));
+        let start = corral_worker::probe::start_time_of(pid);
+        sg.register(&GuardReg {
+            name: "corral:j-9:1".into(),
+            pid,
+            pgid: pid,
+            pid_start: start,
+            tier: Some(0),
+            budget_mb: Some(20),
+            pausable: true,
+            heavy: true,
+            reservation: a.reservation,
+        })
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(!reg_id.is_empty());
+    let g = rig.guard.clone();
+    tokio::task::spawn_blocking(move || g.tick()).await.unwrap();
+    assert!(wait_gone(&mut hog, 4000), "over its budget: killed");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = events.lock().unwrap().clone();
+    let k = got.iter().find(|e| e.kind == "kill").expect("kill event over the socket");
+    assert_eq!((k.unit.as_deref(), k.reason.as_str()), (Some("corral:j-9:1"), "ram_exceeded"));
+    let _ = rig.guard.handle(&json!({ "v": 1, "op": "unregister", "id": reg_id }));
+    server.abort();
+}

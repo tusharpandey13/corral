@@ -36,3 +36,111 @@ pub fn request(socket: &Path, op: &str, fields: Value) -> Result<Value, ClientEr
     BufReader::new(s).read_line(&mut line).map_err(|e| ClientError::Other(format!("no reply from the guard: {e}")))?;
     serde_json::from_str(line.trim()).map_err(|e| ClientError::Other(format!("bad reply from the guard: {e}")))
 }
+
+/// The worker's [`HostGuard`](corral_worker::hostguard::HostGuard) over the guard socket.
+pub struct SocketGuard {
+    pub socket: std::path::PathBuf,
+}
+
+fn reasons_of(r: &Value) -> Vec<corral_proto::api::DeclineReason> {
+    r["reasons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|v| corral_proto::api::DeclineReason {
+            check: v["check"].as_str().unwrap_or("guard").to_string(),
+            reason: v["reason"].as_str().unwrap_or("refused").to_string(),
+        })
+        .collect()
+}
+
+fn call(socket: &Path, op: &str, f: Value) -> Result<Value, String> {
+    let r = request(socket, op, f).map_err(|e| e.to_string())?;
+    match r["error"].as_str() {
+        Some(e) => Err(e.to_string()),
+        None => Ok(r),
+    }
+}
+
+impl corral_worker::hostguard::HostGuard for SocketGuard {
+    fn admit(
+        &self,
+        name: &str,
+        ram_mb: u64,
+        class: corral_proto::job::Class,
+        reserve_s: u64,
+        reservation: Option<&str>,
+    ) -> Result<corral_worker::hostguard::GuardAnswer, String> {
+        let class = if class == corral_proto::job::Class::Light { "light" } else { "heavy" };
+        let r = call(
+            &self.socket,
+            "admit",
+            json!({ "name": name, "ram_mb": ram_mb, "class": class, "profile": "default", "reserve_s": reserve_s, "reservation": reservation }),
+        )?;
+        Ok(corral_worker::hostguard::GuardAnswer {
+            ok: r["ok"] == json!(true),
+            reservation: r["reservation"].as_str().map(String::from),
+            reasons: reasons_of(&r),
+        })
+    }
+
+    fn blocked(&self) -> Result<Vec<corral_proto::api::Blocked>, String> {
+        let r = call(&self.socket, "checks", json!({ "profile": "default" }))?;
+        Ok(r["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["ok"] == json!(false))
+            .map(|c| corral_proto::api::Blocked {
+                check: c["check"].as_str().unwrap_or("guard").to_string(),
+                profile: Some("default".into()),
+                reason: c["reason"].as_str().unwrap_or("").to_string(),
+                since: c["since_ms"].as_i64().map(corral_proto::util::rfc3339),
+            })
+            .collect())
+    }
+
+    fn register(&self, r: &corral_worker::hostguard::GuardReg) -> Result<String, String> {
+        let reply = call(
+            &self.socket,
+            "register",
+            json!({
+                "name": r.name, "pid": r.pid, "pgid": r.pgid, "pid_start": r.pid_start, "tier": r.tier,
+                "budget_mb": r.budget_mb, "pausable": r.pausable, "heavy": r.heavy, "reservation": r.reservation,
+            }),
+        )?;
+        reply["id"].as_str().map(String::from).ok_or_else(|| "the guard returned no registration id".into())
+    }
+
+    fn unregister(&self, id: &str) {
+        let _ = request(&self.socket, "unregister", json!({ "id": id }));
+    }
+
+    fn unreserve(&self, token: &str) {
+        let _ = request(&self.socket, "unreserve", json!({ "token": token }));
+    }
+
+    fn watch(&self, on: &mut dyn FnMut(corral_worker::hostguard::GuardEvent) -> bool) {
+        loop {
+            if let Ok(mut s) = UnixStream::connect(&self.socket)
+                && s.write_all(b"{\"v\":1,\"op\":\"subscribe\",\"topics\":[\"actions\"]}\n").is_ok()
+            {
+                for line in BufReader::new(s).lines() {
+                    let Ok(line) = line else { break };
+                    let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                    let Some(kind) = v["kind"].as_str() else { continue };
+                    let ev = corral_worker::hostguard::GuardEvent {
+                        kind: kind.to_string(),
+                        unit: v["unit"].as_str().map(String::from),
+                        reason: v["reason"].as_str().unwrap_or("").to_string(),
+                        detail: v["detail"].as_str().unwrap_or("").to_string(),
+                    };
+                    if !on(ev) {
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+}
