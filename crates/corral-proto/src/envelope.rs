@@ -60,11 +60,7 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn new(error: ErrorCode, message: impl Into<String>) -> Self {
-        ApiError {
-            error,
-            message: message.into(),
-            extra: Map::new(),
-        }
+        ApiError { error, message: message.into(), extra: Map::new() }
     }
     pub fn bad(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::BadRequest, message)
@@ -105,21 +101,13 @@ pub fn encode_request<B: Serialize>(from: &Identity, req_id: &str, body: &B) -> 
 /// Decode and version-check a request. Returns the envelope and the full JSON object (the body is parsed from it
 /// by the caller, unknown fields ignored).
 pub fn decode_request(bytes: &[u8]) -> Result<(Envelope, Value), ApiError> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|e| ApiError::bad(format!("invalid JSON: {e}")))?;
-    let v = value
-        .get("v")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| ApiError::bad("missing v").with("field", json!("v")))?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| ApiError::bad(format!("invalid JSON: {e}")))?;
+    let v = value.get("v").and_then(Value::as_u64).ok_or_else(|| ApiError::bad("missing v").with("field", json!("v")))?;
     if !SUPPORTED_VERSIONS.contains(&(v as u32)) {
-        return Err(ApiError::new(
-            ErrorCode::VersionUnsupported,
-            format!("protocol version {v} not supported"),
-        )
-        .with("supported", json!(SUPPORTED_VERSIONS)));
+        return Err(ApiError::new(ErrorCode::VersionUnsupported, format!("protocol version {v} not supported"))
+            .with("supported", json!(SUPPORTED_VERSIONS)));
     }
-    let env: Envelope = serde_json::from_value(value.clone())
-        .map_err(|e| ApiError::bad(format!("bad envelope: {e}")))?;
+    let env: Envelope = serde_json::from_value(value.clone()).map_err(|e| ApiError::bad(format!("bad envelope: {e}")))?;
     Ok((env, value))
 }
 
@@ -158,11 +146,9 @@ pub fn encode_result<T: Serialize>(r: &Result<T, ApiError>) -> Vec<u8> {
 
 /// Decode a reply into the result type, or the error it carries.
 pub fn decode_reply<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ApiError> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|e| ApiError::bad(format!("invalid reply JSON: {e}")))?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| ApiError::bad(format!("invalid reply JSON: {e}")))?;
     if value.get("error").is_some() {
-        let err: ApiError = serde_json::from_value(value)
-            .map_err(|e| ApiError::bad(format!("bad error reply: {e}")))?;
+        let err: ApiError = serde_json::from_value(value).map_err(|e| ApiError::bad(format!("bad error reply: {e}")))?;
         return Err(err);
     }
     serde_json::from_value(value).map_err(|e| ApiError::bad(format!("bad reply: {e}")))
@@ -183,10 +169,7 @@ mod tests {
         let (env, val) = decode_request(&bytes).unwrap();
         assert_eq!(env.v, 1);
         assert_eq!(env.from, "owner");
-        assert!(
-            val.get("authz").is_some(),
-            "R-SEC-04: every request schema carries authz"
-        );
+        assert!(val.get("authz").is_some(), "R-SEC-04: every request schema carries authz");
         assert_eq!(body::<Body>(&val).unwrap(), Body { id: "j-1".into() });
     }
 
@@ -199,8 +182,7 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_ignored() {
-        let (_, val) =
-            decode_request(br#"{"v":1,"from":"owner","req_id":"x","id":"a","future":1}"#).unwrap();
+        let (_, val) = decode_request(br#"{"v":1,"from":"owner","req_id":"x","id":"a","future":1}"#).unwrap();
         assert_eq!(body::<Body>(&val).unwrap().id, "a");
     }
 

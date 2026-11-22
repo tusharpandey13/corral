@@ -6,7 +6,7 @@ use time::format_description::well_known::Rfc3339;
 const B32_LOWER: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-fn random_bytes<const N: usize>() -> [u8; N] {
+pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
     getrandom::fill(&mut b).expect("system randomness unavailable");
     b
@@ -57,24 +57,25 @@ pub fn new_job_id(now_ms: i64) -> String {
 }
 
 fn yyyymmdd(ms: i64) -> String {
-    let dt = OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000))
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    let dt = OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000)).unwrap_or(OffsetDateTime::UNIX_EPOCH);
     format!("{:04}{:02}{:02}", dt.year(), dt.month() as u8, dt.day())
 }
 
 /// RFC 3339 UTC, second precision, from unix milliseconds.
 pub fn rfc3339(ms: i64) -> String {
-    let dt = OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000))
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    let dt = OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000)).unwrap_or(OffsetDateTime::UNIX_EPOCH);
     dt.format(&Rfc3339).unwrap_or_default()
+}
+
+/// Parse an RFC 3339 timestamp into unix milliseconds.
+pub fn parse_rfc3339_ms(s: &str) -> Result<i64, String> {
+    OffsetDateTime::parse(s, &Rfc3339).map(|d| d.unix_timestamp() * 1000).map_err(|e| e.to_string())
 }
 
 /// Parse `90s`, `15m`, `2h`, `14d`, `500ms` into milliseconds.
 pub fn parse_duration_ms(s: &str) -> Result<u64, String> {
     let s = s.trim();
-    let split = s
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| format!("duration {s:?} needs a unit (ms, s, m, h, d)"))?;
+    let split = s.find(|c: char| !c.is_ascii_digit()).ok_or_else(|| format!("duration {s:?} needs a unit (ms, s, m, h, d)"))?;
     let (num, unit) = s.split_at(split);
     let n: u64 = num.parse().map_err(|_| format!("bad duration {s:?}"))?;
     let mult = match unit {
@@ -85,8 +86,7 @@ pub fn parse_duration_ms(s: &str) -> Result<u64, String> {
         "d" => 86_400_000,
         _ => return Err(format!("bad duration unit in {s:?} (use ms, s, m, h, d)")),
     };
-    n.checked_mul(mult)
-        .ok_or_else(|| format!("duration {s:?} overflows"))
+    n.checked_mul(mult).ok_or_else(|| format!("duration {s:?} overflows"))
 }
 
 /// Parse `512M`, `4G`, `1024` (megabytes when no suffix is given) into mebibytes.

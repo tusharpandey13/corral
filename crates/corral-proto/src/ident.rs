@@ -68,10 +68,7 @@ impl Identity {
 
 /// Host names appear in subjects: no dots, wildcards or whitespace.
 pub fn valid_host(h: &str) -> bool {
-    !h.is_empty()
-        && h.len() <= 63
-        && h.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !h.is_empty() && h.len() <= 63 && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 impl fmt::Display for Identity {

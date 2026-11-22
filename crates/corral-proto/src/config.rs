@@ -13,21 +13,14 @@ pub struct ConfigError {
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.key.is_empty() {
-            write!(f, "config: {}", self.message)
-        } else {
-            write!(f, "config: {}: {}", self.key, self.message)
-        }
+        if self.key.is_empty() { write!(f, "config: {}", self.message) } else { write!(f, "config: {}: {}", self.key, self.message) }
     }
 }
 
 impl std::error::Error for ConfigError {}
 
 fn err(key: &str, message: impl Into<String>) -> ConfigError {
-    ConfigError {
-        key: key.to_string(),
-        message: message.into(),
-    }
+    ConfigError { key: key.to_string(), message: message.into() }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -157,11 +150,7 @@ pub fn default_paths() -> Vec<PathBuf> {
 pub fn expand(s: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let xdg = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
-    let s = if let Some(rest) = s.strip_prefix("~/") {
-        format!("{home}/{rest}")
-    } else {
-        s.to_string()
-    };
+    let s = if let Some(rest) = s.strip_prefix("~/") { format!("{home}/{rest}") } else { s.to_string() };
     s.replace("$XDG_CONFIG_HOME", &xdg).replace("$HOME", &home)
 }
 
@@ -173,8 +162,7 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| err("", format!("{}: {e}", path.display())))?;
+        let text = std::fs::read_to_string(path).map_err(|e| err("", format!("{}: {e}", path.display())))?;
         Self::parse(&text)
     }
 
@@ -182,45 +170,30 @@ impl Config {
     pub fn load_default() -> Result<Loaded, ConfigError> {
         for p in default_paths() {
             if p.exists() {
-                return Ok(Loaded {
-                    config: Self::load(&p)?,
-                    path: Some(p),
-                });
+                return Ok(Loaded { config: Self::load(&p)?, path: Some(p) });
             }
         }
-        Ok(Loaded {
-            config: Config::default(),
-            path: None,
-        })
+        Ok(Loaded { config: Config::default(), path: None })
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         match self.version {
             Some(1) => {}
             Some(v) => {
-                return Err(err(
-                    "version",
-                    format!("unsupported version {v} (this build reads 1)"),
-                ));
+                return Err(err("version", format!("unsupported version {v} (this build reads 1)")));
             }
             None => return Err(err("version", "required (set version = 1)")),
         }
         if let Some(h) = &self.host
             && !crate::ident::valid_host(h)
         {
-            return Err(err(
-                "host",
-                format!("{h:?} is not a valid host name (letters, digits, - and _)"),
-            ));
+            return Err(err("host", format!("{h:?} is not a valid host name (letters, digits, - and _)")));
         }
         if let Some(c) = &self.client {
             if let Some(i) = &c.identity
                 && crate::ident::Identity::parse(i).is_none()
             {
-                return Err(err(
-                    "client.identity",
-                    format!("{i:?} is not scheduler, owner, worker:<host> or agent:<host>"),
-                ));
+                return Err(err("client.identity", format!("{i:?} is not scheduler, owner, worker:<host> or agent:<host>")));
             }
         }
         if let Some(s) = &self.scheduler {
@@ -245,37 +218,22 @@ impl Config {
                 if matches!(a.as_str(), "0.0.0.0" | "::" | "[::]") && !s.allow_public_bind {
                     return Err(err(
                         &format!("scheduler.listen[{i}]"),
-                        format!(
-                            "{a} binds every interface; list a private address or set allow_public_bind = true"
-                        ),
+                        format!("{a} binds every interface; list a private address or set allow_public_bind = true"),
                     ));
                 }
             }
             if let Some(p) = &s.policy {
                 for a in &p.require_grant {
-                    const KNOWN: [&str; 7] = [
-                        "exclusive",
-                        "priority_high",
-                        "cancel_other",
-                        "resubmit_killed",
-                        "admin",
-                        "lock_none",
-                        "cost_tier",
-                    ];
+                    const KNOWN: [&str; 7] =
+                        ["exclusive", "priority_high", "cancel_other", "resubmit_killed", "admin", "lock_none", "cost_tier"];
                     if !KNOWN.contains(&a.as_str()) {
-                        return Err(err(
-                            "scheduler.policy.require_grant",
-                            format!("unknown action {a:?}"),
-                        ));
+                        return Err(err("scheduler.policy.require_grant", format!("unknown action {a:?}")));
                     }
                 }
             }
         }
         if let Some(w) = &self.worker {
-            for (key, v) in [
-                ("worker.kill_grace", &w.kill_grace),
-                ("worker.keep_failed_runs", &w.keep_failed_runs),
-            ] {
+            for (key, v) in [("worker.kill_grace", &w.kill_grace), ("worker.keep_failed_runs", &w.keep_failed_runs)] {
                 if let Some(v) = v {
                     parse_duration_ms(v).map_err(|m| err(key, m))?;
                 }
@@ -292,16 +250,10 @@ impl Config {
             if let Some(r) = &w.runtime
                 && r != "native"
             {
-                return Err(err(
-                    "worker.runtime",
-                    format!("unknown runtime {r:?} (v1 ships only \"native\")"),
-                ));
+                return Err(err("worker.runtime", format!("unknown runtime {r:?} (v1 ships only \"native\")")));
             }
             if w.cost_tier.unwrap_or(0) > 0 && !self.phase2.as_ref().is_some_and(|p| p.cloud) {
-                return Err(err(
-                    "worker.cost_tier",
-                    "non-zero cost tiers need phase2.cloud = true (not available in v1)",
-                ));
+                return Err(err("worker.cost_tier", "non-zero cost tiers need phase2.cloud = true (not available in v1)"));
             }
             if let Some(l) = &w.heavy_lock
                 && let Some(t) = &l.ttl
@@ -325,16 +277,9 @@ pub struct ClientResolved {
 }
 
 impl ClientCfg {
-    pub fn resolve(
-        file: Option<&ClientCfg>,
-        env: &dyn Fn(&str) -> Option<String>,
-    ) -> ClientResolved {
+    pub fn resolve(file: Option<&ClientCfg>, env: &dyn Fn(&str) -> Option<String>) -> ClientResolved {
         let mut sources = BTreeMap::new();
-        let mut pick = |key: &'static str,
-                        envname: &str,
-                        filev: Option<&String>,
-                        default: Option<&str>|
-         -> Option<String> {
+        let mut pick = |key: &'static str, envname: &str, filev: Option<&String>, default: Option<&str>| -> Option<String> {
             if let Some(v) = env(envname) {
                 sources.insert(key, "env");
                 Some(v)
@@ -348,39 +293,12 @@ impl ClientCfg {
                 None
             }
         };
-        let nats_url = pick(
-            "nats_url",
-            "CORRAL_NATS_URL",
-            file.and_then(|f| f.nats_url.as_ref()),
-            Some("nats://127.0.0.1:4222"),
-        )
-        .unwrap_or_default();
-        let http_url = pick(
-            "http_url",
-            "CORRAL_HTTP_URL",
-            file.and_then(|f| f.http_url.as_ref()),
-            None,
-        );
-        let identity = pick(
-            "identity",
-            "CORRAL_IDENTITY",
-            file.and_then(|f| f.identity.as_ref()),
-            Some("owner"),
-        )
-        .unwrap_or_default();
-        let seed = pick(
-            "nkey_seed_file",
-            "CORRAL_NKEY_SEED_FILE",
-            file.and_then(|f| f.nkey_seed_file.as_ref()),
-            None,
-        );
-        ClientResolved {
-            nats_url,
-            http_url,
-            identity,
-            nkey_seed_file: seed.map(|s| PathBuf::from(expand(&s))),
-            sources,
-        }
+        let nats_url =
+            pick("nats_url", "CORRAL_NATS_URL", file.and_then(|f| f.nats_url.as_ref()), Some("nats://127.0.0.1:4222")).unwrap_or_default();
+        let http_url = pick("http_url", "CORRAL_HTTP_URL", file.and_then(|f| f.http_url.as_ref()), None);
+        let identity = pick("identity", "CORRAL_IDENTITY", file.and_then(|f| f.identity.as_ref()), Some("owner")).unwrap_or_default();
+        let seed = pick("nkey_seed_file", "CORRAL_NKEY_SEED_FILE", file.and_then(|f| f.nkey_seed_file.as_ref()), None);
+        ClientResolved { nats_url, http_url, identity, nkey_seed_file: seed.map(|s| PathBuf::from(expand(&s))), sources }
     }
 }
 
@@ -398,14 +316,8 @@ mod tests {
         assert!(key_of("version = 1\nbogus = 2\n").contains("bogus"));
         assert!(key_of("version = 1\n[worker]\nslotz = {}\n").contains("slotz"));
         assert!(key_of("[worker]\n").contains("version"));
-        assert!(
-            key_of("version = 1\n[scheduler]\nlease_ttl = \"90\"\n")
-                .contains("scheduler.lease_ttl")
-        );
-        assert!(
-            key_of("version = 1\n[worker]\nadmit_floor = \"lots\"\n")
-                .contains("worker.admit_floor")
-        );
+        assert!(key_of("version = 1\n[scheduler]\nlease_ttl = \"90\"\n").contains("scheduler.lease_ttl"));
+        assert!(key_of("version = 1\n[worker]\nadmit_floor = \"lots\"\n").contains("worker.admit_floor"));
         assert!(key_of("version = 1\nhost = \"a.b\"\n").contains("host"));
     }
 
@@ -451,11 +363,7 @@ runtime = "native"
 
     #[test]
     fn client_precedence_env_over_file_over_default() {
-        let file = ClientCfg {
-            nats_url: Some("nats://file:1".into()),
-            identity: Some("agent:h".into()),
-            ..Default::default()
-        };
+        let file = ClientCfg { nats_url: Some("nats://file:1".into()), identity: Some("agent:h".into()), ..Default::default() };
         let env = |k: &str| (k == "CORRAL_NATS_URL").then(|| "nats://env:2".to_string());
         let r = ClientCfg::resolve(Some(&file), &env);
         assert_eq!(r.nats_url, "nats://env:2");

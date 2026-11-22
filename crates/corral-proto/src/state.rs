@@ -15,7 +15,8 @@ pub enum Event {
     ExitedOk,
     /// `finished{outcome: exited}` with a non-zero exit code.
     ExitedFailed,
-    /// `finished{outcome: killed}` for a reason other than `cancelled`, or the scheduler's timeout backstop.
+    /// `finished{outcome: killed}` for a reason other than `cancelled`, or the scheduler's timeout backstop
+    /// (which also applies to a silent, orphaned attempt: see the implementation note in SPEC.md).
     Killed,
     Cancel,
     LeaseExpired,
@@ -60,12 +61,7 @@ pub struct IllegalTransition {
 
 impl std::fmt::Display for IllegalTransition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "illegal transition: {:?} in state {}",
-            self.event,
-            self.from.as_str()
-        )
+        write!(f, "illegal transition: {:?} in state {}", self.event, self.from.as_str())
     }
 }
 
@@ -80,7 +76,7 @@ pub fn next(from: JobState, ev: Event) -> Result<JobState, IllegalTransition> {
         (Claimed, Started) => Running,
         (Claimed | Running, ExitedOk) => Succeeded,
         (Claimed | Running, ExitedFailed) => Failed,
-        (Claimed | Running, Killed) => JobState::Killed,
+        (Claimed | Running | Orphaned, Killed) => JobState::Killed,
         (Uploading | Queued | Claimed | Running | Orphaned, Cancel) => Cancelled,
         (Claimed | Running, LeaseExpired) => Orphaned,
         (Orphaned, Heartbeat) => Running,
@@ -113,6 +109,7 @@ mod tests {
             (Running, Event::ExitedFailed, Failed),
             (Claimed, Event::Killed, JobState::Killed),
             (Running, Event::Killed, JobState::Killed),
+            (Orphaned, Event::Killed, JobState::Killed),
             (Uploading, Event::Cancel, Cancelled),
             (Queued, Event::Cancel, Cancelled),
             (Claimed, Event::Cancel, Cancelled),
@@ -132,21 +129,11 @@ mod tests {
         let mut checked = 0;
         for st in JobState::ALL {
             for ev in Event::ALL {
-                let expected = legal
-                    .iter()
-                    .find(|(s, e, _)| *s == st && *e == ev)
-                    .map(|(_, _, t)| *t);
+                let expected = legal.iter().find(|(s, e, _)| *s == st && *e == ev).map(|(_, _, t)| *t);
                 let got = next(st, ev);
                 match expected {
                     Some(t) => assert_eq!(got, Ok(t), "{st:?} + {ev:?}"),
-                    None => assert_eq!(
-                        got,
-                        Err(IllegalTransition {
-                            from: st,
-                            event: ev
-                        }),
-                        "{st:?} + {ev:?}"
-                    ),
+                    None => assert_eq!(got, Err(IllegalTransition { from: st, event: ev }), "{st:?} + {ev:?}"),
                 }
                 checked += 1;
             }

@@ -55,15 +55,7 @@ impl JobState {
     }
 
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            JobState::Succeeded
-                | JobState::Failed
-                | JobState::Killed
-                | JobState::Cancelled
-                | JobState::Lost
-                | JobState::Expired
-        )
+        matches!(self, JobState::Succeeded | JobState::Failed | JobState::Killed | JobState::Cancelled | JobState::Lost | JobState::Expired)
     }
 }
 
@@ -99,19 +91,9 @@ impl KillReason {
     }
     pub fn parse(s: &str) -> Option<KillReason> {
         use KillReason::*;
-        [
-            RamExceeded,
-            SystemMemory,
-            Thermal,
-            KillSwitch,
-            Timeout,
-            ExternalSignal,
-            OomKernel,
-            StaleLease,
-            LeaseKilled,
-        ]
-        .into_iter()
-        .find(|r| r.as_str() == s)
+        [RamExceeded, SystemMemory, Thermal, KillSwitch, Timeout, ExternalSignal, OomKernel, StaleLease, LeaseKilled]
+            .into_iter()
+            .find(|r| r.as_str() == s)
     }
 }
 
@@ -248,8 +230,7 @@ pub struct JobSpec {
 impl JobSpec {
     /// A minimal heavy-less spec for tests and tools.
     pub fn simple(cmd: &[&str]) -> JobSpec {
-        serde_json::from_value(serde_json::json!({ "cmd": cmd, "class": "light", "ram_mb": 64 }))
-            .expect("valid spec")
+        serde_json::from_value(serde_json::json!({ "cmd": cmd, "class": "light", "ram_mb": 64 })).expect("valid spec")
     }
 
     /// RAM the job declares; light jobs without a declaration use 0.
@@ -334,16 +315,8 @@ mod tests {
 
     #[test]
     fn git_input_uses_ref_key() {
-        let i: Input =
-            serde_json::from_str(r#"{"kind":"git","repo":"r","ref":"main","sha":"abc"}"#).unwrap();
-        assert_eq!(
-            i,
-            Input::Git {
-                repo: "r".into(),
-                git_ref: "main".into(),
-                sha: "abc".into()
-            }
-        );
+        let i: Input = serde_json::from_str(r#"{"kind":"git","repo":"r","ref":"main","sha":"abc"}"#).unwrap();
+        assert_eq!(i, Input::Git { repo: "r".into(), git_ref: "main".into(), sha: "abc".into() });
     }
 
     #[test]

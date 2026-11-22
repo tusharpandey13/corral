@@ -72,6 +72,11 @@ pub struct ArtifactsReply {
     pub url: String,
     pub token: String,
     pub state: String,
+    /// Token for `GET /v1/jobs/<id>/logs/<attempt>/<stream>` (`log:get`).
+    #[serde(default)]
+    pub log_token: Option<String>,
+    #[serde(default)]
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -176,6 +181,9 @@ pub struct ClaimReply {
     pub artifact_url: Option<String>,
     #[serde(default)]
     pub http_token: Option<String>,
+    /// Token for downloading a snapshot input (`input:get`).
+    #[serde(default)]
+    pub input_token: Option<String>,
     #[serde(default)]
     pub retry_after_s: u64,
 }

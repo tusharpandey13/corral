@@ -46,11 +46,7 @@ pub fn mint(key: &[u8], t: &Token) -> String {
     let payload = serde_json::to_vec(t).expect("json encode");
     let mut m = mac(key);
     m.update(&payload);
-    format!(
-        "{}.{}",
-        B64.encode(&payload),
-        B64.encode(m.finalize().into_bytes())
-    )
+    format!("{}.{}", B64.encode(&payload), B64.encode(m.finalize().into_bytes()))
 }
 
 /// Verify signature and expiry (`now_s` is unix seconds).
@@ -69,13 +65,7 @@ pub fn verify(key: &[u8], token: &str, now_s: i64) -> Result<Token, TokenError> 
 }
 
 /// Verify and also require the scope `job` + `verb`.
-pub fn verify_scope(
-    key: &[u8],
-    token: &str,
-    now_s: i64,
-    job: &str,
-    verb: &str,
-) -> Result<Token, TokenError> {
+pub fn verify_scope(key: &[u8], token: &str, now_s: i64, job: &str, verb: &str) -> Result<Token, TokenError> {
     let t = verify(key, token, now_s)?;
     if t.job != job || t.verb != verb {
         return Err(TokenError::WrongScope);
@@ -88,12 +78,7 @@ mod tests {
     use super::*;
 
     fn tok(job: &str, verb: &str, exp: i64) -> Token {
-        Token {
-            job: job.into(),
-            verb: verb.into(),
-            lease: None,
-            exp,
-        }
+        Token { job: job.into(), verb: verb.into(), lease: None, exp }
     }
 
     /// U-17 / R-SEC-05: scope, expiry, tampering.
@@ -102,39 +87,21 @@ mod tests {
         let key = b"k";
         let t = mint(key, &tok("j-a", "artifacts:get", 100));
         assert!(verify_scope(key, &t, 50, "j-a", "artifacts:get").is_ok());
-        assert_eq!(
-            verify_scope(key, &t, 50, "j-b", "artifacts:get"),
-            Err(TokenError::WrongScope),
-            "token for job A cannot read job B"
-        );
-        assert_eq!(
-            verify_scope(key, &t, 50, "j-a", "log:get"),
-            Err(TokenError::WrongScope)
-        );
+        assert_eq!(verify_scope(key, &t, 50, "j-b", "artifacts:get"), Err(TokenError::WrongScope), "token for job A cannot read job B");
+        assert_eq!(verify_scope(key, &t, 50, "j-a", "log:get"), Err(TokenError::WrongScope));
         assert_eq!(verify(key, &t, 100), Err(TokenError::Expired));
         assert_eq!(verify(b"other", &t, 50), Err(TokenError::BadSignature));
         let (p, s) = t.split_once('.').unwrap();
         let forged = mint(key, &tok("j-b", "artifacts:get", 100));
         let (fp, _) = forged.split_once('.').unwrap();
-        assert_eq!(
-            verify(key, &format!("{fp}.{s}"), 50),
-            Err(TokenError::BadSignature)
-        );
-        assert_eq!(
-            verify(key, &format!("{p}x"), 50),
-            Err(TokenError::Malformed)
-        );
+        assert_eq!(verify(key, &format!("{fp}.{s}"), 50), Err(TokenError::BadSignature));
+        assert_eq!(verify(key, &format!("{p}x"), 50), Err(TokenError::Malformed));
         assert_eq!(verify(key, "garbage", 50), Err(TokenError::Malformed));
     }
 
     #[test]
     fn lease_binding_round_trips() {
-        let t = Token {
-            job: "j".into(),
-            verb: "artifacts:put".into(),
-            lease: Some("abc".into()),
-            exp: 10,
-        };
+        let t = Token { job: "j".into(), verb: "artifacts:put".into(), lease: Some("abc".into()), exp: 10 };
         assert_eq!(verify(b"k", &mint(b"k", &t), 1).unwrap(), t);
     }
 }

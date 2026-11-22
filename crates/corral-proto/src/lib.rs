@@ -19,3 +19,4 @@ pub mod util;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Protocol versions this build accepts.
 pub const SUPPORTED_VERSIONS: [u32; 1] = [1];
+pub mod bus;

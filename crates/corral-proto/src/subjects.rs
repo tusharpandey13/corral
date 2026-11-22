@@ -90,25 +90,10 @@ mod tests {
 
     #[test]
     fn parses() {
-        assert_eq!(
-            parse_api("corral.api.agent-laptop.submit"),
-            Some(ApiSubject {
-                who: "agent-laptop",
-                verb: "submit"
-            })
-        );
+        assert_eq!(parse_api("corral.api.agent-laptop.submit"), Some(ApiSubject { who: "agent-laptop", verb: "submit" }));
         assert_eq!(parse_api("corral.api.x"), None);
-        assert_eq!(
-            parse_work("corral.work.w.claim"),
-            Some(WorkSubject::Claim { worker: "w" })
-        );
-        assert_eq!(
-            parse_work("corral.work.w.j-1.hb"),
-            Some(WorkSubject::Heartbeat {
-                worker: "w",
-                job: "j-1"
-            })
-        );
+        assert_eq!(parse_work("corral.work.w.claim"), Some(WorkSubject::Claim { worker: "w" }));
+        assert_eq!(parse_work("corral.work.w.j-1.hb"), Some(WorkSubject::Heartbeat { worker: "w", job: "j-1" }));
         assert_eq!(parse_work("corral.work.w.j-1.nope"), None);
         assert_eq!(parse_log("corral.log.w.j-1.out"), Some(("w", "j-1", "out")));
         assert_eq!(parse_log("corral.log.w.j-1.bad"), None);
