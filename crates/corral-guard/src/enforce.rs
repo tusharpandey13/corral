@@ -19,6 +19,7 @@
 use crate::decisions::Decision;
 use crate::procs::Unit;
 use crate::settings::HookSettings;
+use corral_proto::util::PipeDrain;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -123,7 +124,6 @@ pub struct RealHooks;
 
 impl HookRunner for RealHooks {
     fn run(&self, cmd: &[String], timeout: Duration) -> Result<HookOutcome, String> {
-        use std::io::Read;
         use std::os::unix::process::CommandExt;
         let (prog, args) = cmd.split_first().ok_or("empty hook command")?;
         let mut child = std::process::Command::new(prog)
@@ -137,20 +137,8 @@ impl HookRunner for RealHooks {
             .spawn()
             .map_err(|e| format!("cannot run {prog}: {e}"))?;
         let pgid = child.id();
-        let readers: Vec<_> = [
-            child.stdout.take().map(|o| Box::new(o) as Box<dyn Read + Send>),
-            child.stderr.take().map(|o| Box::new(o) as Box<dyn Read + Send>),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|mut r| {
-            std::thread::spawn(move || {
-                let mut b = Vec::new();
-                let _ = r.read_to_end(&mut b);
-                b
-            })
-        })
-        .collect();
+        let readers: Vec<_> =
+            [child.stdout.take().map(PipeDrain::spawn), child.stderr.take().map(PipeDrain::spawn)].into_iter().flatten().collect();
         let deadline = std::time::Instant::now() + timeout;
         let (status, timed_out) = loop {
             match child.try_wait() {
@@ -167,9 +155,10 @@ impl HookRunner for RealHooks {
                 Err(e) => return Err(e.to_string()),
             }
         };
+        // a background process the hook left behind may hold the pipes open: wait for the output only briefly
         let mut all = Vec::new();
         for h in readers {
-            all.extend(h.join().unwrap_or_default());
+            all.extend(h.finish(Duration::from_millis(300)));
         }
         let text = String::from_utf8_lossy(&all).to_string();
         let tail: String = text.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
@@ -867,5 +856,15 @@ mod tests {
         let hung = RealHooks.run(&["sh".into(), "-c".into(), "sleep 30".into()], Duration::from_millis(300)).unwrap();
         assert!(hung.timed_out && t.elapsed() < Duration::from_secs(5));
         assert!(RealHooks.run(&["/nonexistent/hook".into()], Duration::from_secs(1)).is_err());
+    }
+
+    /// L3 / note 44: a hook that leaves a background child holding its stdout does not block the guard past the
+    /// hook's own exit.
+    #[test]
+    fn a_hook_that_leaves_a_background_child_does_not_block() {
+        let t = std::time::Instant::now();
+        let o = RealHooks.run(&["sh".into(), "-c".into(), "echo done; sleep 3 &".into()], Duration::from_secs(10)).unwrap();
+        assert_eq!((o.code, o.tail.as_str()), (Some(0), "done"));
+        assert!(t.elapsed() < Duration::from_secs(2), "returned after {:?}", t.elapsed());
     }
 }

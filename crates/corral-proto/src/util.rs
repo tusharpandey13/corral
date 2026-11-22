@@ -117,6 +117,39 @@ pub fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// A pipe read on its own thread into a buffer, so the reader can stop waiting at a deadline. Reading to end-of-file
+/// would block for as long as *any* process holds the write end, and a child that left a daemon behind (a keep-awake
+/// helper, a background job of a hook) holds it for hours.
+pub struct PipeDrain {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl PipeDrain {
+    pub fn spawn(mut r: impl std::io::Read + Send + 'static) -> PipeDrain {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, done) = std::sync::mpsc::channel();
+        let b = buf.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = r.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                b.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]);
+            }
+            let _ = tx.send(());
+        });
+        PipeDrain { buf, done }
+    }
+
+    /// What has been read once the pipe reaches end-of-file or `wait` has passed, whichever is first.
+    pub fn finish(self, wait: std::time::Duration) -> Vec<u8> {
+        let _ = self.done.recv_timeout(wait);
+        self.buf.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +180,16 @@ mod tests {
     #[test]
     fn rfc3339_formats_utc() {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn a_pipe_drain_stops_waiting_when_the_write_end_stays_open() {
+        let (rd, mut wr) = std::io::pipe().unwrap();
+        std::io::Write::write_all(&mut wr, b"partial").unwrap();
+        let t = std::time::Instant::now();
+        let got = PipeDrain::spawn(rd).finish(std::time::Duration::from_millis(200));
+        assert_eq!(got, b"partial");
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        drop(wr);
     }
 }
