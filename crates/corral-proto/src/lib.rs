@@ -6,6 +6,7 @@
 pub mod api;
 pub mod config;
 pub mod envelope;
+pub mod guardcfg;
 pub mod ident;
 pub mod job;
 pub mod perms;

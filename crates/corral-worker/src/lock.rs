@@ -37,6 +37,41 @@ pub struct LockFile {
     pub started: f64,
     pub heartbeat: f64,
     pub ttl_s: f64,
+    /// corral's own additions (GUARDS.md 5.2); legacy readers ignore the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corral: Option<CorralExtra>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CorralExtra {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// SHA-256 (hex) of the holder's `CORRAL_LOCK_TOKEN`: a child that presents the token re-enters (R-LOCK-04).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_sha: Option<String>,
+}
+
+/// Which stale locks may be taken over (GUARDS.md 5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Takeover {
+    /// Stale locks held by a corral agent (the default).
+    #[default]
+    Corral,
+    /// Any stale lock.
+    Any,
+    /// No stale lock: the owner clears it.
+    Never,
+}
+
+/// What `status` found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LockStatus {
+    Free,
+    Held { file: LockFile, stale: bool },
+    /// The file exists and does not parse.
+    Unreadable,
 }
 
 impl LockFile {
@@ -74,13 +109,38 @@ pub trait LockStore: Send + Sync {
 pub struct FileLock {
     path: PathBuf,
     clock: Arc<dyn WallClock>,
-    /// Stale locks of non-corral holders are taken over only when the lock is configured `takeover = "any"`.
-    takeover_any: bool,
+    takeover: Takeover,
 }
 
 impl FileLock {
     pub fn new(path: impl Into<PathBuf>, clock: Arc<dyn WallClock>) -> FileLock {
-        FileLock { path: path.into(), clock, takeover_any: false }
+        FileLock { path: path.into(), clock, takeover: Takeover::Corral }
+    }
+
+    pub fn takeover(mut self, t: Takeover) -> FileLock {
+        self.takeover = t;
+        self
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn status(&self) -> LockStatus {
+        match self.read() {
+            None => LockStatus::Free,
+            Some(None) => LockStatus::Unreadable,
+            Some(Some(file)) => {
+                let stale = file.stale(self.clock.now_s());
+                LockStatus::Held { file, stale }
+            }
+        }
+    }
+
+    /// Does a live lock carry this token hash? (R-LOCK-04: the holder's child re-enters instead of acquiring.)
+    pub fn holds_token(&self, token_sha: &str) -> bool {
+        let now = self.clock.now_s();
+        matches!(self.read(), Some(Some(f)) if !f.stale(now) && f.corral.as_ref().and_then(|c| c.token_sha.as_deref()) == Some(token_sha))
     }
 
     fn read(&self) -> Option<Option<LockFile>> {
@@ -126,11 +186,11 @@ impl FileLock {
     }
 }
 
-impl LockStore for FileLock {
-    fn acquire(&self, agent: &str, purpose: &str, pid: u32, ttl_s: u64) -> Result<(), Busy> {
+impl FileLock {
+    /// Non-blocking acquire of a full lock record (apps, corral extras). `acquire` is this with the common fields.
+    pub fn acquire_with(&self, mine: LockFile) -> Result<(), Busy> {
         let now = self.clock.now_s();
-        let mine =
-            LockFile { agent: agent.into(), purpose: purpose.into(), apps: vec![], pid, started: now, heartbeat: now, ttl_s: ttl_s as f64 };
+        let agent = mine.agent.as_str();
         for _ in 0..3 {
             match self.create_exclusive(&mine) {
                 Ok(()) => return Ok(()),
@@ -152,7 +212,10 @@ impl LockStore for FileLock {
             }
             let holder = current.as_ref().map(|h| h.agent.clone()).unwrap_or_else(|| "unparseable lock file".into());
             let corral_holder = current.as_ref().is_some_and(|h| h.agent.starts_with("corral"));
-            if !corral_holder && !self.takeover_any && current.is_some() {
+            if self.takeover == Takeover::Never && current.is_some() {
+                return Err(Busy(format!("stale lock held by {holder}; takeover is disabled for this lock")));
+            }
+            if !corral_holder && self.takeover != Takeover::Any && current.is_some() {
                 return Err(Busy(format!("stale lock held by {holder}; not taking over a non-corral holder")));
             }
             // Takeover: an O_EXCL `.takeover` file serialises racers; re-read; delete; log one line.
@@ -180,6 +243,22 @@ impl LockStore for FileLock {
             let _ = std::fs::remove_file(&tk);
         }
         Err(Busy("lock is contended; try again".into()))
+    }
+}
+
+impl LockStore for FileLock {
+    fn acquire(&self, agent: &str, purpose: &str, pid: u32, ttl_s: u64) -> Result<(), Busy> {
+        let now = self.clock.now_s();
+        self.acquire_with(LockFile {
+            agent: agent.into(),
+            purpose: purpose.into(),
+            apps: vec![],
+            pid,
+            started: now,
+            heartbeat: now,
+            ttl_s: ttl_s as f64,
+            corral: None,
+        })
     }
 
     fn renew(&self, agent: &str) -> Result<(), String> {
@@ -308,6 +387,7 @@ mod tests {
                 started: 0.0,
                 heartbeat: 0.0,
                 ttl_s: 300.0,
+                corral: None,
             })
             .unwrap(),
         )
