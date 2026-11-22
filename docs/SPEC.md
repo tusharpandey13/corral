@@ -363,19 +363,25 @@ behaviour lives in the companion documents named per group.
 - **R-AGENT-01** `corral agent submit --on W --repo PATH --base REF --branch NAME --brief FILE [--provider P]
   [--model M] [--deadline D] [--fallback wait|local]` creates a job of kind `agent`. The worker creates a git worktree
   of the repository at the base ref (fetched from the configured exchange remote) and starts the agent through the
-  configured **agent runner** (a command template that talks to a local agent daemon or CLI). **AC:** with a fake
-  runner, the worktree exists at the base sha and the runner received the brief.
+  configured **agent runner**: a command template (placeholders `{workdir}`, `{brief}`, `{result}`, `{provider}`,
+  `{model}`) in worker config; corral has no agent-specific adapter (Q18). **Runner contract:** the command stays in
+  the foreground until the agent has finished, so the guard, cancel and memory accounting apply to its process group;
+  it exits 0 on success; it writes a JSON result file at `{result}` (`status`, `summary`, optional `branch`). A runner
+  whose agent outlives it violates the contract; a site-specific wrapper script (outside corral) adapts tools that
+  detach. **AC:** with a fake runner, the worktree exists at the base sha, the runner received the brief, and a runner
+  that exits without writing `{result}` yields `agent_result.status = "no_result"`.
 - **R-AGENT-02** On completion the worker commits nothing itself, pushes the agent's branch to the exchange remote and
-  reports `agent_result`: branch, head sha, summary (capped 4 KiB), diffstat, runner exit status. Transcripts stay on
+  reports `agent_result`: branch, head sha, summary from the result file (capped 4 KiB), diffstat, runner exit
+  status; the result file is kept as an artifact. Transcripts stay on
   the worker's host. **AC:** result fields present; branch fetchable by the submitter.
-- **R-AGENT-03** Agent jobs use a named slot `agent` (default 4 per host) and are admitted as light work plus a
+- **R-AGENT-03** Agent jobs use a named slot `agent` (default 6 per host) and are admitted as light work plus a
   per-agent memory reservation (`agent_ram`, default 256 MiB); commands the agent runs take heavy slots under normal
   admission. **AC:** cap + 1 submits → one `queued` with `agent slots full`.
 - **R-AGENT-04** Waiting is explained like any job; at `deadline`, `fallback = wait` notifies and keeps waiting,
   `fallback = local` runs the agent on the submitter's host. **AC:** fake clock past deadline → one notification, or a
   local start.
-- **R-AGENT-05** Cancel stops the agent through the runner, then the process group; the worktree is removed unless
-  `--keep`. **AC:** cancel mid-run → runner stop called; job `cancelled`.
+- **R-AGENT-05** Cancel sends TERM to the runner's process group, then KILL after the grace period; the worktree is removed unless
+  `--keep`. **AC:** cancel mid-run → runner group terminated; job `cancelled`.
 
 ### 4.16 Command placement: classifier and hook mode (draft, round 2)
 
@@ -843,7 +849,7 @@ working tree; keep-awake holds; a queue that tolerates workers offline for days.
 - **Q17. (owner: test it before hook mode ships; one combined hook in the meantime) Harness rewrite semantics** [unverified]: whether a pre-tool hook's input rewrite must be paired with an
   "allow" decision (bypassing the harness's own permission rules) and how several rewriting hooks combine. Proposed:
   one hook entry point that can chain other rewriters, until verified.
-- **Q18. Agent runner contract:** command template (proposed) vs a runtime adapter of its own.
+- **Q18. (decided: command template with a foreground + result-file contract, R-AGENT-01) Agent runner contract.**
 - **Q19. (decided: HTTP DPoP first in phase 2, NATS profile after review) DPoP over NATS** [unverified as a standard profile]: DPoP proofs bind an HTTP method and URL; for the NATS
   auth callout corral would define `htm = "CONNECT"`, `htu = "nats://<server>/corral"`. Proposed: HTTP DPoP per RFC
   9449 in phase 2 first, NATS profile after review.
