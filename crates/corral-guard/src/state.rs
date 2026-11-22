@@ -47,7 +47,7 @@ pub struct StateDir {
     dir: PathBuf,
 }
 
-fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
     f.write_all(content.as_bytes())?;
@@ -74,10 +74,15 @@ impl StateDir {
         self.dir.join("STOP")
     }
 
-    /// The kill switch. A STOP file that exists but cannot be parsed still counts as ON (fail closed).
+    /// The kill switch. A STOP file that exists but cannot be read or parsed still counts as ON (fail closed).
     pub fn stop(&self) -> Option<StopState> {
-        let text = std::fs::read_to_string(self.stop_path()).ok()?;
-        Some(serde_json::from_str(&text).unwrap_or(StopState { since_ms: 0, by: "unknown".into(), reason: "unreadable STOP file".into() }))
+        let unreadable = || StopState { since_ms: 0, by: "unknown".into(), reason: "unreadable STOP file".into() };
+        match std::fs::read_to_string(self.stop_path()) {
+            Ok(text) => Some(serde_json::from_str(&text).unwrap_or_else(|_| unreadable())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            // present but not readable (permissions, I/O error, not UTF-8): the switch may be on, so it is (L4)
+            Err(_) => Some(unreadable()),
+        }
     }
 
     pub fn set_stop(&self, s: &StopState) -> std::io::Result<()> {
@@ -122,6 +127,19 @@ mod tests {
         again.clear_stop().unwrap();
         assert!(again.stop().is_none());
         again.clear_stop().unwrap(); // idempotent
+    }
+
+    /// L4 / R-GUARD-05: a STOP file that is there but cannot be read (here: not a regular file; also permissions or an
+    /// I/O error) is ON, never "off".
+    #[test]
+    fn an_unreadable_stop_file_is_on() {
+        let d = tmpdir("stop-unreadable");
+        let s = StateDir::open(&d).unwrap();
+        std::fs::create_dir(d.join("STOP")).unwrap();
+        let st = s.stop().expect("on");
+        assert_eq!(st.reason, "unreadable STOP file");
+        std::fs::remove_dir(d.join("STOP")).unwrap();
+        assert!(s.stop().is_none(), "absent is off");
     }
 
     #[test]

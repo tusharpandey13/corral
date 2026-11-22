@@ -73,10 +73,19 @@ impl Ticket {
     /// guard (the worker's own budget watchdog still applies) and the caller says so in the job's system log.
     pub fn register_with_guard(&self, mut r: GuardReg) -> Result<(), String> {
         let Some(g) = &self.guard else { return Ok(()) };
-        r.reservation = self.reservation.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let id = g.register(&r)?;
-        *self.reg_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
-        Ok(())
+        let token = self.reservation.lock().unwrap_or_else(|e| e.into_inner()).take();
+        r.reservation = token.clone();
+        match g.register(&r) {
+            Ok(id) => {
+                *self.reg_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+                Ok(())
+            }
+            Err(e) => {
+                // the guard did not take it: the reservation is still ours to release (dropping the ticket does)
+                *self.reservation.lock().unwrap_or_else(|e| e.into_inner()) = token;
+                Err(e)
+            }
+        }
     }
 
     pub fn holds_lock(&self) -> bool {
@@ -554,6 +563,30 @@ mod tests {
         let calls = g.calls();
         assert!(calls.contains(&"unregister reg-corral:j-1:1".to_string()));
         assert!(!calls.iter().any(|c| c.starts_with("unreserve")), "the reservation went with the registration: {calls:?}");
+    }
+
+    /// L1 (note 41): a registration the guard refuses leaves the reservation with the ticket, and dropping the ticket
+    /// releases it; the slot is not held until the reservation expires.
+    #[test]
+    fn a_failed_registration_does_not_leak_the_reservation() {
+        let g = crate::hostguard::FakeGuard::new();
+        let (a, _) = guarded(g.clone());
+        let t = a.try_start(&need("j-1", 100)).unwrap();
+        *g.down.lock().unwrap() = Some("socket closed".into());
+        let r = GuardReg {
+            name: "corral:j-1:1".into(),
+            pid: 5,
+            pgid: 5,
+            pid_start: "s".into(),
+            tier: None,
+            budget_mb: None,
+            pausable: false,
+            heavy: true,
+            reservation: None,
+        };
+        assert!(t.register_with_guard(r).is_err());
+        drop(t);
+        assert!(g.calls().iter().any(|c| c == "unreserve tok-1"), "{:?}", g.calls());
     }
 
     /// R-AWAKE-03: a required provider that fails refuses heavy work with `keepawake_unavailable`, not light work.

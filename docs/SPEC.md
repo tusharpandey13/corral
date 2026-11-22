@@ -1155,26 +1155,48 @@ legacy shims. Where the approved text was ambiguous or silent, M3 picked these d
     equals the one the sample recorded; a pid with no recorded start time is not signalled (fail closed). Never signalled:
     pid 0 and 1, the guard, its own process group, any unit holding a `never` process. A whole process group is signalled
     only when the unit is that group (`pgid == leader`, leader still verifies); otherwise per pid. TERM, then KILL after
-    `kill_grace` for the pids that still verify, on a background thread (the sampler never blocks). A unit still alive
+    `kill_grace` for the pids that still verify, on a background thread (the sampler never blocks). Start times are read
+    with one batched `ps -o pid=,lstart= -p a,b,c` under a 3 s timeout (not one `ps` per pid); a `ps` that fails or hangs
+    means *unknown*, never "gone": nothing is signalled on a guess, the kill is logged as `skipped`
+    (`start_time_unverifiable`) and tried again after the retry time, and the KILL step asks again a few times before it
+    gives up and logs that it did not send. Without `ps` the guard cannot verify start times, so it cannot signal;
+    reading them without a fork needs a native call and is not done on macOS. A unit still alive
     `kill_grace + settle + 4 s` after its kill is tried again (observe's "assumed gone" is observe-only). Unknown
     measurements fail closed: an unreadable process table decides nothing (`skipped`), and unreadable memory fails
     admission.
-43. **Pauses are recorded.** `SIGSTOP` is written to `<state_dir>/paused.json` (pid and start time) before it is sent; a
-    guard that starts, or stops in order, continues every process in that file that is still the same process. A paused
-    unit that is killed leaves the file.
+43. **Pauses are recorded.** `<state_dir>/paused.json` holds, per unit key, its group (when the unit is that group) and
+    its pids with start times. It is written atomically and synced **before** `SIGSTOP` is sent; a pause that cannot be
+    recorded is not sent (`pause_unrecorded`). Every decision round the executor reconciles the file against the
+    engine's paused set and continues (CONT, to the group while its leader still verifies, so members that joined after
+    the sample are included, plus each recorded pid that still has its start time) every entry the engine no longer
+    holds: a unit that vanished from one sample, was resumed, was escalated or killed. An entry that cannot be checked
+    (`ps` failed) stays and is retried every round; one whose processes are gone is dropped. Startup and shutdown run
+    the same continue for all entries. A `paused.json` that exists but cannot be parsed is not treated as empty: it is
+    kept as `paused.json.corrupt`, logged (`paused_state_unreadable`) and reported on the log; the first M3 format (a bare
+    pid list) is still read. A kill of a paused unit sends CONT after the TERM, or the TERM would wait unread.
+    **Protected units are not paused** (their `protected` and `protect_unresolved` flags make `pause` skip them, GUARDS.md
+    3.2): pause_max would otherwise turn a pressure-level pause into a kill that only `critical` and `stop` may order,
+    and protection that appears after a pause resumes the unit at pause_max. **An unreadable free-memory reading below
+    `pressure` resumes** a paused unit (a missing number is not pressure), instead of letting pause_max kill it.
 44. **Hooks.** Restore hooks run on their own thread with a clean environment (`PATH` only), in their own process group,
     ended at their `timeout` (R-GUARD-07); exit code and the last 300 characters of output are logged. `kill = "hook"`
     and `kill = "cgroup"` matchers fall back to per-process signalling (a per-matcher hook command and `cgroup.kill` are
     not built). Notifications and `on_takeover` hooks are still not run.
 45. **The kill switch acts at once.** In enforce mode `stop` runs a decision round itself instead of waiting for the next
     sample. Admission slot counts follow the last sample, so a killed unit frees its slot at the next one (at most 2 s).
+    A `STOP` file that exists but cannot be read counts as ON (fail closed). `Guard::shutdown` waits for a round in
+    flight and later rounds do nothing, so a round that was already running when the server stopped cannot STOP what
+    shutdown has just continued.
 46. **Keep-awake.** One provider ships: `hold-cli` (an external command, default `awake` on `PATH`, configured as
     `[guard.keepawake] command`) plus `none`; `caffeinate` and `systemd-inhibit` are refused at start as not built.
     Hold names are `corral:<job>:<attempt>` (per attempt, so an old attempt's late release cannot end a new attempt's
-    hold) and `corral:run:<name>`: everything starts with `corral:` and `holds --json`, which lists all owners, is
+    hold) and `corral:run:<name>:<run id>` (a random id per invocation, so two runs of one program never share a hold): everything starts with `corral:` and `holds --json`, which lists all owners, is
     filtered by that prefix (GUARDS.md 8 said the provider listed only its own). Window `min(timeout, 2 h) + 10 min`,
     renewed every 30 min by repeating `hold`, bound to the unit's pid, released on every exit path (and by the provider
-    when the pid dies or the window ends). `release --all` and killing by name are never used. The worker talks to the
+    when the pid dies or the window ends). A renewal still running when the hold is released finishes first and nothing
+    renews after the release (one gate serialises them). The provider's and a hook's output is read with a short deadline
+    after the process exits: a daemon the provider left behind (`awake` leaves `caffeinate`) that keeps the pipe open
+    cannot block the call. `release --all` and killing by name are never used. The worker talks to the
     provider directly (the guard need not be up); the guard offers the same through `hold` / `release_hold` / `holds`
     for `corral run --hold` (default window 2 h 10 min). `[guard.keepawake] required_for = ["heavy"]` is the spelling of
     GUARDS.md's `keepawake_required_for`: while the provider probe (`holds --json`, cached 15 s) fails, heavy work is
@@ -1186,9 +1208,13 @@ legacy shims. Where the approved text was ambiguous or silent, M3 picked these d
     the presence `blocked` list (with `since`), which is how a host-local wait reaches the job's waiting text (R-ADM-04,
     the half M2 deferred). After start the job is registered (`corral:<job>:<attempt>`, tier 0 unless a matcher says
     otherwise, pausable, budget = declared RAM, which the guard multiplies by `budget_slack`) and unregistered when the
-    ticket drops. A failed registration is noted in the job's system log and the worker's own watchdog still applies.
+    ticket drops. A failed registration is noted in the job's system log and the worker's own watchdog still applies, and the worker
+    releases the reservation. The guard does not drop a reservation when the job registers: it marks it claimed, and it
+    keeps counting for its heavy slot and its RAM until a sample shows the registered unit (or the job unregisters), so a
+    second heavy admit cannot slip into the gap; a registration that cannot be saved is rolled back.
     The worker follows the guard's `kill` events; a job that dies of a signal while the worker has a guard waits up to 3 s
-    for the event, and `finished.reason` is the guard's (`system_memory`, `thermal`, `kill_switch`, `ram_exceeded`),
+    for the event (only when the exit looks like a kill: a signal, or 137 / 143; a job that ended by itself with another
+    code keeps it), and `finished.reason` is the guard's (`system_memory`, `thermal`, `kill_switch`, `ram_exceeded`),
     never `external_signal` (R-GUARD-08). `presence.kill_switch` follows the `kill_switch_off` check. A pause notice is
     tracked but does not stop the job's timeout clock.
 48. **macOS memory for the worker** is `hw.memsize` times `kern.memorystatus_level` (what jetsam uses); anything
@@ -1196,7 +1222,11 @@ legacy shims. Where the approved text was ambiguous or silent, M3 picked these d
     taskpolicy -b` on macOS (R-EXEC-04). **Escapees on macOS:** `ps` does not show another process's environment, so the
     Linux `CORRAL_JOB_ID` tag scan cannot be ported; descendants that `setsid` are recorded by the 1 s ppid-walk samples
     and by the guard's matchers, and a double fork inside one second can still escape (residual, M1 review item).
-    `phys_footprint` still needs a native call and stays RSS.
+    **The guard's footprint is RSS on macOS** (the sum of the unit's `rss`): `phys_footprint` (which counts GPU and
+    compressed memory) needs `proc_pid_rusage`, a native call that needs `unsafe`, and the `footprint` and `top` tools are
+    too slow to run for every unit every sample under a timeout, so budgets and tiers compare RSS and GUARDS.md 2.1 says
+    so. A unit whose real footprint is mostly compressed or GPU memory is under-measured; the system-level `free %` and
+    pressure levels, which jetsam uses, are the backstop.
 49. **Run-as abstraction (owner scope change).** The native runtime starts jobs through a `Launcher` trait
     (`SameUser` is the only implementation) and takes `HOME` from it; nothing assumes the job runs as the worker's user,
     in the owner's checkout or in the owner's home. Approved job profiles (a command prefix, a dedicated runner user,
@@ -1210,8 +1240,15 @@ legacy shims. Where the approved text was ambiguous or silent, M3 picked these d
     deployment, not to this repo; golden tests pin the output. `watch` is `guard await`: it blocks while the guard
     answers and exits 1 after three missed looks.
 51. **`corral run`.** `--hold` takes the named hold bound to the command's pid. A command that dies of a signal the guard
-    sent (a `kill` decision for `run:<name>` within two minutes of the guard's clock) exits 125 and prints the reason.
-52. **Not in M3:** guard-held locks and `lock.*` socket ops (still `unavailable`; locks are lease files taken with
+    sent (a `kill` decision for this invocation's unit, `run:<name>:<run id>`, within two minutes of the guard's clock)
+    exits 125 and prints the reason.
+52. **Built-in `never`** (GUARDS.md 3.2) is corral's own daemons, matched by role (`corral scheduler`, `corral worker`,
+    `corral guard run`, global options skipped) plus the guard itself and its ancestors, `nats-server` and the system
+    processes. A process that merely runs another corral subcommand (a job calling `corral admit`, `corral run`) is an
+    ordinary member of its unit and is counted and killable. Once a worker's leader has been reaped, the group is
+    KILLed only while the process table still shows a member in it (the group id may have been reused), and an
+    unreadable table signals nothing.
+53. **Not in M3:** guard-held locks and `lock.*` socket ops (still `unavailable`; locks are lease files taken with
     `corral lock` or by the worker), `on_takeover` hooks, flock locks (M4), the `measurement` and `gui` profiles (M4),
     notifications, the `caffeinate` and `systemd-inhibit` providers, `cgroup.kill` and per-unit cgroup freeze, pause
     accounting in job timeouts, per-job guard `tier` from the job spec, the scheduler's `admin kill_switch` forward to

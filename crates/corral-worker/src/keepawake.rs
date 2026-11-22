@@ -6,7 +6,7 @@
 //! (`hold --for D --owner N [--pid P] [--display]`, `release --owner N`, `holds --json`), which owns its processes and
 //! its own bookkeeping. corral signals nothing here.
 
-use std::io::Read;
+use corral_proto::util::PipeDrain;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -20,9 +20,31 @@ pub fn job_owner(job: &str, attempt: u32) -> String {
     format!("{OWNER_PREFIX}{job}:{attempt}")
 }
 
-/// The hold name of a `corral run` command.
-pub fn run_owner(name: &str) -> String {
-    format!("{OWNER_PREFIX}run:{name}")
+/// The hold name of one `corral run` invocation: the command's name made safe, plus the invocation's unique id, so two
+/// runs of the same program never share (and so never release or misattribute) each other's hold (M3).
+pub fn run_owner(name: &str, uid: &str) -> String {
+    let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    format!("{OWNER_PREFIX}run:{safe}:{uid}")
+}
+
+/// Serialises hold renewals with the release: once `release` has run, no renewal still in flight (or started later)
+/// can create the hold again (L2). A renewal that was already running finishes first, then the release follows it.
+#[derive(Clone, Default)]
+pub struct HoldGate(Arc<Mutex<bool>>);
+
+impl HoldGate {
+    /// Run a renewal unless the hold was released. Returns `None` if it was.
+    pub fn renew<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let released = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (!*released).then(f)
+    }
+
+    /// Mark the hold released and run the release; later renewals are no-ops. Idempotent for the mark.
+    pub fn release<T>(&self, f: impl FnOnce() -> T) -> T {
+        let mut released = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *released = true;
+        f()
+    }
 }
 
 /// `min(timeout, 2 h) + 10 min` (GUARDS.md 8): renewed every 30 min while the unit runs.
@@ -90,15 +112,7 @@ impl HoldCli {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("cannot run keep-awake provider {}: {e}", self.command.display()))?;
-        let (mut out, mut err) = (child.stdout.take(), child.stderr.take());
-        let reader = |mut r: Box<dyn Read + Send>| {
-            std::thread::spawn(move || {
-                let mut s = String::new();
-                let _ = r.read_to_string(&mut s);
-                s
-            })
-        };
-        let (to, te) = (out.take().map(|o| reader(Box::new(o))), err.take().map(|e| reader(Box::new(e))));
+        let (to, te) = (child.stdout.take().map(PipeDrain::spawn), child.stderr.take().map(PipeDrain::spawn));
         let deadline = Instant::now() + self.timeout;
         let status = loop {
             match child.try_wait() {
@@ -112,8 +126,11 @@ impl HoldCli {
                 Err(e) => return Err(format!("keep-awake provider: {e}")),
             }
         };
-        let stdout = to.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-        let stderr = te.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+        // The provider may have left a daemon (caffeinate) holding the pipe open: take what it printed and move on.
+        let drain = |d: Option<PipeDrain>| {
+            d.map(|d| String::from_utf8_lossy(&d.finish(Duration::from_millis(300))).to_string()).unwrap_or_default()
+        };
+        let (stdout, stderr) = (drain(to), drain(te));
         let text = if status.success() {
             stdout
         } else {
@@ -342,6 +359,7 @@ pub struct HoldGuard {
     provider: Arc<dyn KeepAwake>,
     owner: String,
     task: Option<tokio::task::JoinHandle<()>>,
+    gate: HoldGate,
     released: bool,
 }
 
@@ -354,20 +372,33 @@ impl HoldGuard {
         bound_pid: Option<u32>,
         display: bool,
     ) -> Result<HoldGuard, String> {
+        HoldGuard::take_every(provider, owner, timeout, bound_pid, display, RENEW_EVERY).await
+    }
+
+    pub(crate) async fn take_every(
+        provider: Arc<dyn KeepAwake>,
+        owner: String,
+        timeout: Duration,
+        bound_pid: Option<u32>,
+        display: bool,
+        every: Duration,
+    ) -> Result<HoldGuard, String> {
         let window = hold_window(timeout);
         let (p, o) = (provider.clone(), owner.clone());
         tokio::task::spawn_blocking(move || p.hold(&o, window, bound_pid, display)).await.map_err(|e| e.to_string())??;
         let (p, o) = (provider.clone(), owner.clone());
+        let gate = HoldGate::default();
+        let g = gate.clone();
         let task = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(RENEW_EVERY).await;
-                let (p, o) = (p.clone(), o.clone());
-                if let Ok(Err(e)) = tokio::task::spawn_blocking(move || p.hold(&o, window, bound_pid, display)).await {
+                tokio::time::sleep(every).await;
+                let (p, o, g) = (p.clone(), o.clone(), g.clone());
+                if let Ok(Some(Err(e))) = tokio::task::spawn_blocking(move || g.renew(|| p.hold(&o, window, bound_pid, display))).await {
                     tracing::warn!("keep-awake renewal failed: {e}");
                 }
             }
         });
-        Ok(HoldGuard { provider, owner, task: Some(task), released: false })
+        Ok(HoldGuard { provider, owner, task: Some(task), gate, released: false })
     }
 
     pub fn owner(&self) -> &str {
@@ -381,7 +412,7 @@ impl HoldGuard {
         }
         if !self.released {
             self.released = true;
-            if let Err(e) = self.provider.release(&self.owner) {
+            if let Err(e) = self.gate.release(|| self.provider.release(&self.owner)) {
                 tracing::warn!("keep-awake release of {} failed (the hold expires by itself): {e}", self.owner);
             }
         }
@@ -492,7 +523,9 @@ esac"#;
         assert_eq!(hold_window(Duration::from_secs(30)), Duration::from_secs(630));
         assert_eq!(hold_window(Duration::from_secs(86_400)), Duration::from_secs(7_800), "capped at 2 h + 10 min");
         assert_eq!(job_owner("j-1", 2), "corral:j-1:2");
-        assert_eq!(run_owner("build"), "corral:run:build");
+        assert_eq!(run_owner("build", "x1"), "corral:run:build:x1");
+        assert_eq!(run_owner("my build", "x1"), "corral:run:my_build:x1");
+        assert_ne!(run_owner("make", "a1"), run_owner("make", "b2"), "two runs of one program have different holds");
     }
 
     /// The guard takes the hold, renews on its own task and releases on every exit path, drop included.
@@ -505,5 +538,66 @@ esac"#;
         assert_eq!(fake.calls().last(), Some(&Call::Release("corral:j-1:1".into())));
         fake.break_it("provider gone");
         assert!(HoldGuard::take(fake.clone(), "corral:j-2:1".into(), Duration::from_secs(1), None, false).await.is_err());
+    }
+
+    /// A provider whose `hold` is slow, recording the order of calls.
+    struct Slow(Mutex<Vec<&'static str>>);
+    impl KeepAwake for Slow {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn probe(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn hold(&self, owner: &str, _: Duration, _: Option<u32>, _: bool) -> Result<HoldInfo, String> {
+            std::thread::sleep(Duration::from_millis(250));
+            self.0.lock().unwrap().push("hold");
+            Ok(HoldInfo { owner: owner.into(), until: None, pid: None, bound_pid: None, display: false })
+        }
+        fn release(&self, _: &str) -> Result<(), String> {
+            self.0.lock().unwrap().push("release");
+            Ok(())
+        }
+        fn list(&self) -> Result<Vec<HoldInfo>, String> {
+            Ok(vec![])
+        }
+    }
+
+    /// L2 / note 46: a renewal still in flight when the hold is released cannot re-create the hold afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renewal_in_flight_cannot_outlive_the_release() {
+        let slow = Arc::new(Slow(Mutex::new(vec![])));
+        let mut g =
+            HoldGuard::take_every(slow.clone(), "corral:j-1:1".into(), Duration::from_secs(1), None, false, Duration::from_millis(30))
+                .await
+                .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await; // a renewal is running now
+        g.release();
+        let at_release = slow.0.lock().unwrap().clone();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let later = slow.0.lock().unwrap().clone();
+        assert_eq!(at_release.last(), Some(&"release"), "{at_release:?}");
+        assert_eq!(later, at_release, "nothing after the release: {later:?}");
+    }
+
+    /// The gate on its own: a renewal after the release does nothing.
+    #[test]
+    fn the_hold_gate_refuses_renewals_after_release() {
+        let g = HoldGate::default();
+        assert_eq!(g.renew(|| 1), Some(1));
+        g.release(|| ());
+        assert_eq!(g.renew(|| 1), None);
+    }
+
+    /// L3 / note 46: a provider that leaves a daemon holding its stdout (`awake` leaves caffeinate) does not block
+    /// the call past the provider's own exit.
+    #[test]
+    fn a_provider_that_leaves_a_daemon_holding_stdout_does_not_hang_the_call() {
+        let d = tmp("daemon");
+        let k = HoldCli::new(script(&d, "echo \"hold $5 until 2026-11-22 18:00:00 (pid 4242)\"; sleep 6 &"));
+        let t = Instant::now();
+        let h = k.hold("corral:x", Duration::from_secs(60), None, false).unwrap();
+        assert_eq!(h.pid, Some(4242), "what it printed is still read");
+        assert!(t.elapsed() < Duration::from_secs(4), "returned after {:?}", t.elapsed());
     }
 }

@@ -86,6 +86,9 @@ pub struct Guard {
     keepawake: Option<(Arc<dyn KeepAwake>, bool, CachedProbe)>,
     inner: Mutex<Inner>,
     events: broadcast::Sender<String>,
+    /// Held for a whole decision round and by `shutdown`; `true` once shut down. A round that was in flight when the
+    /// server stopped cannot STOP anything after shutdown has continued what was paused (L7).
+    rounds: Mutex<bool>,
 }
 
 fn err(msg: impl Into<String>) -> Value {
@@ -115,7 +118,12 @@ impl Guard {
         let regs = state.load_regs();
         let (events, _) = broadcast::channel(256);
         let exec = (!settings.observe).then(|| {
-            Executor::new(Arc::new(RealSys), Arc::new(RealHooks), std::time::Duration::from_millis(settings.kill_grace_ms), state.path())
+            Executor::new(
+                Arc::new(RealSys::default()),
+                Arc::new(RealHooks),
+                std::time::Duration::from_millis(settings.kill_grace_ms),
+                state.path(),
+            )
         });
         if let Some(x) = &exec {
             // processes a previous run of this guard left stopped are continued
@@ -150,6 +158,7 @@ impl Guard {
             resolver: deps.resolver,
             clock: deps.clock,
             events,
+            rounds: Mutex::new(false),
         })
     }
 
@@ -209,6 +218,9 @@ impl Guard {
 
     /// Orderly shutdown: continue anything this guard paused.
     pub fn shutdown(&self) {
+        // waits for a round in flight, and stops later rounds from acting
+        let mut down = self.rounds.lock().unwrap_or_else(|e| e.into_inner());
+        *down = true;
         if let Some(x) = &self.exec {
             x.resume_all_paused();
         }
@@ -274,6 +286,10 @@ impl Guard {
 
     /// One decision round from already-read inputs (tests feed these directly).
     pub fn tick_with(&self, sample: Sample, table: Option<Vec<ProcInfo>>, protect: HashMap<String, Protect>) {
+        let down = self.rounds.lock().unwrap_or_else(|e| e.into_inner());
+        if *down {
+            return;
+        }
         let now = sample.t_ms;
         let stop = self.state.stop();
         let mut g = self.lock();
@@ -300,6 +316,9 @@ impl Guard {
         g.table_ok = units.is_some();
         g.units = units.unwrap_or_default();
         g.sample = sample;
+        // a claimed reservation ends once a sample shows its unit (the unit counts for itself from then on)
+        let seen: Vec<String> = g.units.iter().filter_map(|u| u.reg_id.clone()).collect();
+        g.reservations.retain(|r| r.claimed_by.as_ref().is_none_or(|id| !seen.contains(id)));
         if let Some(x) = &self.exec {
             x.set_level(g.engine.level().name());
         }
@@ -310,6 +329,7 @@ impl Guard {
             let u = d.key.as_ref().and_then(|k| g.units.iter().find(|u| &u.key == k).cloned());
             todo.push((d, u));
         }
+        let paused_keys = g.engine.paused_keys();
         drop(g);
         let Some(x) = &self.exec else { return };
         for (d, u) in todo {
@@ -325,6 +345,8 @@ impl Guard {
                 _ => {}
             }
         }
+        // anything recorded as stopped that the engine no longer holds as paused is continued now (note 43)
+        x.reconcile(&paused_keys);
     }
 
     fn record(&self, g: &mut Inner, d: Decision) -> Decision {
@@ -401,6 +423,7 @@ impl Guard {
                 ram_mb: req.ram_mb,
                 heavy: req.class == Class::Heavy,
                 until_ms: until,
+                claimed_by: None,
             });
             reply["reservation"] = json!(token);
             reply["until_ms"] = json!(until);
@@ -461,9 +484,6 @@ impl Guard {
         if let Some(r) = g.regs.iter().find(|r| r.pgid == pgid as u32 && r.pid_start == start) {
             return json!({ "v": 1, "ok": true, "id": r.id });
         }
-        if let Some(tok) = v.get("reservation").and_then(Value::as_str) {
-            g.reservations.retain(|r| r.token != tok);
-        }
         let r = Registration {
             id: random_b32(10),
             name: name.to_string(),
@@ -479,7 +499,16 @@ impl Guard {
         let id = r.id.clone();
         g.regs.push(r);
         if let Err(e) = self.state.save_regs(&g.regs) {
+            // not registered means not registered: the reservation stays with the caller, who releases it (L1)
+            g.regs.retain(|r| r.id != id);
             return err(format!("cannot persist registrations: {e}"));
+        }
+        // The reservation is not dropped now: until a sample has seen the unit (and its memory), it still counts for
+        // its slot and its RAM, or a second heavy job is admitted into the gap (M2).
+        if let Some(tok) = v.get("reservation").and_then(Value::as_str) {
+            for r in g.reservations.iter_mut().filter(|r| r.token == tok) {
+                r.claimed_by = Some(id.clone());
+            }
         }
         json!({ "v": 1, "ok": true, "id": id })
     }
@@ -487,6 +516,7 @@ impl Guard {
     fn unregister(&self, id: &str) -> Value {
         let mut g = self.lock();
         g.regs.retain(|r| r.id != id);
+        g.reservations.retain(|r| r.claimed_by.as_deref() != Some(id));
         let _ = self.state.save_regs(&g.regs);
         json!({ "v": 1, "ok": true })
     }

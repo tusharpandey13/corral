@@ -176,6 +176,30 @@ fn signal_unit(table: &dyn ProcessTable, r: &NativeRunning, s: UnitSignal) {
     }
 }
 
+/// What to KILL once the leader has been reaped: its group only while the table still shows a member in it (the group
+/// id is free for reuse by an unrelated group otherwise), and the recorded escapees that still have their start time.
+/// An unreadable table gives nothing: it cannot be verified, so nothing is signalled (L5).
+fn sweep_targets(table: &dyn ProcessTable, r: &NativeRunning) -> (bool, Vec<u32>) {
+    let Some(snap) = table.snapshot() else { return (false, vec![]) };
+    members_of(table, r, &snap);
+    let group = snap.iter().any(|p| p.pgid == r.pgid);
+    let esc = r.escapees.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let pids = esc.into_iter().filter(|(pid, start)| snap.iter().any(|p| p.pid == *pid && p.start == *start)).map(|(p, _)| p).collect();
+    (group, pids)
+}
+
+fn sweep_after_exit(table: &dyn ProcessTable, r: &NativeRunning) {
+    let (group, pids) = sweep_targets(table, r);
+    if group && let Some(g) = rustix::process::Pid::from_raw(r.pgid as i32) {
+        let _ = rustix::process::kill_process_group(g, sig(UnitSignal::Kill));
+    }
+    for pid in pids {
+        if let Some(p) = rustix::process::Pid::from_raw(pid as i32) {
+            let _ = rustix::process::kill_process(p, sig(UnitSignal::Kill));
+        }
+    }
+}
+
 impl Runtime for NativeRuntime {
     type Prepared = NativePrepared;
     type Running = NativeRunning;
@@ -263,7 +287,7 @@ impl Runtime for NativeRuntime {
         use std::os::unix::process::ExitStatusExt;
         let status = r.child.lock().await.wait().await.map_err(|e| RuntimeError::Other(e.to_string()))?;
         // The leader is reaped; sweep what it left behind (the group cannot be reused while members exist).
-        signal_unit(self.table.as_ref(), r, UnitSignal::Kill);
+        sweep_after_exit(self.table.as_ref(), r);
         Ok(ExitInfo { code: status.code(), signal: status.signal(), by_runtime: None })
     }
 
@@ -314,6 +338,24 @@ mod tests {
             tag: vec![],
             escapees: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// L5 (note 42): once the leader is reaped its group is KILLed only while a member still shows in the table; an
+    /// unreadable table signals nothing.
+    #[tokio::test]
+    async fn the_group_is_swept_only_while_it_has_members() {
+        let r = running();
+        let member = Proc { pid: 40_001, ppid: 1, pgid: 40_000, rss_kb: 1, start: "a".into() };
+        let other = Proc { pid: 50_000, ppid: 1, pgid: 50_000, rss_kb: 1, start: "b".into() };
+        assert!(sweep_targets(&Table(Some(vec![member])), &r).0);
+        assert_eq!(sweep_targets(&Table(Some(vec![other])), &r), (false, vec![]), "group id possibly reused: left alone");
+        assert_eq!(sweep_targets(&Table(None), &r), (false, vec![]));
+        // a recorded escapee is swept by pid only while its start time matches
+        r.escapees.lock().unwrap().insert(60_000, "t1".into());
+        let same = Proc { pid: 60_000, ppid: 1, pgid: 60_000, rss_kb: 1, start: "t1".into() };
+        let reused = Proc { pid: 60_000, ppid: 1, pgid: 60_000, rss_kb: 1, start: "t2".into() };
+        assert_eq!(sweep_targets(&Table(Some(vec![same])), &r).1, vec![60_000]);
+        assert!(sweep_targets(&Table(Some(vec![reused])), &r).1.is_empty());
     }
 
     /// G1 (M1 review): an unreadable or empty process table is "unknown", never a footprint of zero.

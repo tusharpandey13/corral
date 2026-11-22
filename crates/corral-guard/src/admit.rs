@@ -61,6 +61,8 @@ pub struct Reservation {
     pub ram_mb: u64,
     pub heavy: bool,
     pub until_ms: i64,
+    /// Set when the job registered: the reservation then stands in for the unit until a sample has seen it (M2).
+    pub claimed_by: Option<String>,
 }
 
 pub struct Ctx<'a> {
@@ -312,7 +314,7 @@ mod tests {
         w.units[0].has_never = true;
         assert!(heavy_slot(&w.ctx(true), None).ok, "a never-matched unit (the owner's own work) is not counted");
         w.units.clear();
-        w.res = vec![Reservation { token: "tok".into(), name: "other".into(), ram_mb: 10, heavy: true, until_ms: 1 }];
+        w.res = vec![Reservation { token: "tok".into(), name: "other".into(), ram_mb: 10, heavy: true, until_ms: 1, claimed_by: None }];
         assert!(!heavy_slot(&w.ctx(true), None).ok);
         assert!(heavy_slot(&w.ctx(true), Some("tok")).ok, "the re-check under a lock ignores the caller's own reservation");
         let mut l = req(10);

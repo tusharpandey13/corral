@@ -133,10 +133,12 @@ impl Engine {
 
     fn resume_ok(&self, s: &Sample) -> bool {
         let c = self.eval.cfg();
+        // A reading that is missing is not pressure: the caller already requires the level to be below `pressure`, and a
+        // unit must not be killed at `pause_max` only because a probe could not be read (note 43).
         if self.cfg.macos {
-            s.free_pct.is_some_and(|f| f >= c.resume_free_pct) && s.pressure.is_none_or(|p| p <= 1)
+            s.free_pct.is_none_or(|f| f >= c.resume_free_pct) && s.pressure.is_none_or(|p| p <= 1)
         } else {
-            s.avail_mb.is_some_and(|a| a >= c.resume_avail_mb)
+            s.avail_mb.is_none_or(|a| a >= c.resume_avail_mb)
         }
     }
 
@@ -304,8 +306,12 @@ impl Engine {
                 }
             }
             Level::Pressure => {
-                let to_pause: Vec<&Unit> =
-                    candidates(self).into_iter().filter(|u| u.pausable && !self.paused.contains_key(&u.key)).collect();
+                let to_pause: Vec<&Unit> = candidates(self)
+                    .into_iter()
+                    // a protected (or unresolved-protected) unit dies only at critical or stop: it is not paused either, or
+                    // pause_max would turn the pause into a kill at pressure level (R-GUARD-03)
+                    .filter(|u| u.pausable && !u.protected && !u.protect_unresolved && !self.paused.contains_key(&u.key))
+                    .collect();
                 for u in to_pause {
                     out.push(self.unit_decision(
                         now,
@@ -338,7 +344,16 @@ impl Engine {
             self.paused.remove(&key);
         }
         for (key, th) in escalated {
-            if let Some(u) = units.iter().find(|u| u.key == key && !u.has_never) {
+            if let Some(u) = units.iter().find(|u| u.key == key && (u.protected || u.protect_unresolved) && !u.has_never) {
+                // protection can appear after the pause (a resolver answered late): continue it, never kill it here
+                out.push(self.unit_decision(
+                    now,
+                    "would_resume",
+                    u,
+                    "protected",
+                    format!("{ctx}; paused longer than pause_max but protected: resumed, not killed"),
+                ));
+            } else if let Some(u) = units.iter().find(|u| u.key == key && !u.has_never) {
                 out.push(self.unit_decision(
                     now,
                     "would_kill",
@@ -540,6 +555,102 @@ pub mod tests {
         units.push(unit("g13", 3, 10));
         let d = e.tick(Tick { now_ms: 4_000, sample: &free(80.0), units: Some(&units), stop: Some(&stop) });
         assert_eq!(kills(&d), vec![(3, "kill_switch".into())]);
+    }
+
+    fn kinds(d: &[Decision], k: &str) -> usize {
+        d.iter().filter(|d| d.kind == k).count()
+    }
+
+    fn pausable(key: &str) -> Unit {
+        let mut u = unit(key, 0, 100);
+        u.pausable = true;
+        u
+    }
+
+    /// M1 / R-GUARD-03 (note 43): a protected or unresolved-protected unit dies only at critical or stop; pause_max
+    /// must not turn a pressure-level pause into a kill, so it is not paused at all.
+    #[test]
+    fn a_protected_pausable_unit_is_neither_paused_nor_killed_at_pressure() {
+        for unresolved in [false, true] {
+            let mut u = pausable("g10");
+            u.protected = !unresolved;
+            u.protect_unresolved = unresolved;
+            let units = vec![u];
+            let mut e = engine();
+            let mut all = vec![];
+            for i in 0..3 {
+                all.extend(e.tick(Tick { now_ms: i * 2000, sample: &free(21.0), units: Some(&units), stop: None }));
+            }
+            all.extend(e.tick(Tick { now_ms: 70_000, sample: &free(21.0), units: Some(&units), stop: None }));
+            assert_eq!((kinds(&all, "would_pause"), kinds(&all, "would_kill")), (0, 0), "{all:?}");
+        }
+    }
+
+    /// M1: protection that appears after the pause (a resolver answered late) resumes the unit at pause_max.
+    #[test]
+    fn protection_appearing_after_a_pause_resumes_instead_of_escalating() {
+        let mut e = engine();
+        let units = vec![pausable("g10")];
+        let mut all = vec![];
+        for i in 0..3 {
+            all.extend(e.tick(Tick { now_ms: i * 2000, sample: &free(21.0), units: Some(&units), stop: None }));
+        }
+        assert_eq!(kinds(&all, "would_pause"), 1);
+        let mut u = pausable("g10");
+        u.protected = true;
+        let d = e.tick(Tick { now_ms: 70_000, sample: &free(21.0), units: Some(&[u]), stop: None });
+        assert_eq!((kinds(&d, "would_kill"), kinds(&d, "would_resume")), (0, 1), "{d:?}");
+    }
+
+    /// M5 / note 43: an unreadable free-memory reading below pressure resumes the unit; it is not killed at pause_max
+    /// for want of a number.
+    #[test]
+    fn an_unknown_reading_below_pressure_resumes_a_paused_unit() {
+        let units = vec![pausable("g10")];
+        let mut e = engine();
+        let mut all = vec![];
+        for i in 0..3 {
+            all.extend(e.tick(Tick { now_ms: i * 2000, sample: &free(21.0), units: Some(&units), stop: None }));
+        }
+        assert_eq!(kinds(&all, "would_pause"), 1);
+        let unknown = Sample { free_pct: None, total_mb: Some(16_000), pressure: Some(1), ..Sample::default() };
+        for i in 3..40 {
+            all.extend(e.tick(Tick { now_ms: i * 2000, sample: &unknown, units: Some(&units), stop: None }));
+        }
+        assert_eq!((kinds(&all, "would_resume"), kinds(&all, "would_kill")), (1, 0), "{all:?}");
+    }
+
+    /// Note 43: a paused unit that gains a `never` member is not killed at pause_max (never wins), and the engine lets
+    /// go of it so the executor's reconcile continues it.
+    #[test]
+    fn a_paused_unit_that_gains_a_never_member_is_not_escalated() {
+        let mut e = engine();
+        let units = vec![pausable("g10")];
+        for i in 0..3 {
+            e.tick(Tick { now_ms: i * 2000, sample: &free(21.0), units: Some(&units), stop: None });
+        }
+        assert_eq!(e.paused_keys(), vec!["g10".to_string()]);
+        let mut u = pausable("g10");
+        u.has_never = true;
+        let d = e.tick(Tick { now_ms: 70_000, sample: &free(21.0), units: Some(&[u]), stop: None });
+        assert_eq!(kinds(&d, "would_kill"), 0, "{d:?}");
+        assert!(e.paused_keys().is_empty(), "released to the executor's reconcile");
+    }
+
+    /// Note 42: a unit that survives a real kill is tried again after retry_ms, not before; in observe mode it is not.
+    #[test]
+    fn enforce_retries_a_unit_that_survived_its_kill_after_retry_ms() {
+        let mut e = engine();
+        e.cfg.enforce = true;
+        let units = vec![unit("g10", 0, 100)];
+        let k = |e: &mut Engine, ms| kills(&e.tick(Tick { now_ms: ms, sample: &free(19.0), units: Some(&units), stop: None })).len();
+        assert_eq!(k(&mut e, 0), 1);
+        assert_eq!(k(&mut e, 10_000), 0, "inside retry_ms");
+        assert_eq!(k(&mut e, 22_000), 1, "still alive after retry_ms: the kill did not take");
+        let mut o = engine();
+        o.cfg.enforce = false;
+        assert_eq!(kills(&o.tick(Tick { now_ms: 0, sample: &free(19.0), units: Some(&units), stop: None })).len(), 1);
+        assert_eq!(kills(&o.tick(Tick { now_ms: 22_000, sample: &free(19.0), units: Some(&units), stop: None })).len(), 0);
     }
 
     #[test]

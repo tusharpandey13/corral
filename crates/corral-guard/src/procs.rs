@@ -352,7 +352,33 @@ pub struct Rules<'a> {
     pub me: u32,
 }
 
-const BUILTIN_NEVER: [&str; 6] = ["corral", "nats-server", "launchd", "systemd", "loginwindow", "WindowServer"];
+const BUILTIN_NEVER: [&str; 5] = ["nats-server", "launchd", "systemd", "loginwindow", "WindowServer"];
+
+/// Is this one of corral's own long-running daemons: `corral scheduler`, `corral worker` or `corral guard run`
+/// (global options skipped)? Only these are built-in never. A job that merely runs some other `corral` subcommand
+/// (`corral admit`, `corral run -- ...`) is an ordinary process of its unit (L8); the guard itself and its ancestors
+/// are protected by pid.
+pub fn is_corral_daemon(cmdline: &str) -> bool {
+    const VALUE_FLAGS: [&str; 5] = ["--config", "--nats-url", "--http-url", "--identity", "--nkey-seed-file"];
+    let mut it = cmdline.split_whitespace();
+    if it.next().and_then(|a| a.rsplit('/').next()) != Some("corral") {
+        return false;
+    }
+    let mut positional = Vec::new();
+    while let Some(t) = it.next() {
+        if t.starts_with('-') {
+            if VALUE_FLAGS.contains(&t) {
+                it.next();
+            }
+        } else {
+            positional.push(t);
+            if positional.len() == 2 {
+                break;
+            }
+        }
+    }
+    matches!(positional.as_slice(), ["scheduler" | "worker", ..] | ["guard", "run"])
+}
 
 fn descendants(children: &HashMap<u32, Vec<u32>>, root: u32) -> Vec<u32> {
     let mut seen = vec![root];
@@ -403,6 +429,7 @@ pub fn build_units(table: &[ProcInfo], src: &dyn ProcSource, rules: &Rules<'_>, 
         p.pid <= 1
             || p.pid == rules.me
             || ancestors.contains(&p.pid)
+            || is_corral_daemon(&p.cmdline)
             || BUILTIN_NEVER.contains(&p.comm().as_str())
             || rules.never.iter().any(|s| s.matches(p, &cx))
     };
@@ -633,6 +660,9 @@ pub mod tests {
                 p(20, 1, 20, 500, "llama-server --model a"),
                 p(21, 1, 21, 500, "llama-server --model b -avd personal"),
                 p(30, 1, 30, 10, "corral guard run llama-server"),
+                p(31, 1, 31, 10, "corral worker --config /etc/corral/corral.toml llama-server"),
+                p(32, 1, 32, 10, "/usr/local/bin/corral run --hold llama-server -- make"),
+                p(33, 1, 33, 10, "corral admit llama-server worker"),
             ],
             ..FakeProcs::default()
         };
@@ -643,7 +673,10 @@ pub mod tests {
         let by: HashMap<u32, &Unit> = units.iter().map(|u| (u.leader, u)).collect();
         assert!(!by[&20].has_never);
         assert!(by[&21].has_never, "a configured never rule wins over the matcher");
-        assert!(by[&30].has_never, "the corral binary itself is built-in never, whatever its arguments");
+        assert!(by[&30].has_never, "corral's own daemons are built-in never");
+        assert!(by[&31].has_never, "also with global options before the subcommand");
+        // L8: a job that happens to run a corral subcommand is not unkillable
+        assert!(!by[&32].has_never && !by[&33].has_never, "`corral run` and `corral admit` are ordinary processes");
     }
 
     #[test]

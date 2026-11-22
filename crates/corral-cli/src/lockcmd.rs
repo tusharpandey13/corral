@@ -271,7 +271,9 @@ pub async fn run_cmd(a: RunArgs, cfg: &Config) -> i32 {
     let agent = format!("corral-run:{name}");
     let inherited = std::env::var(TOKEN_ENV).ok();
     let lock_token = lockcli::new_token();
-    let admit_name = format!("run:{name}");
+    // unique per invocation: two runs of the same program must not share a hold or a unit name (M3)
+    let run_id = corral_proto::util::random_b32(6).to_ascii_lowercase();
+    let admit_name = format!("run:{name}:{run_id}");
     let mut delay = Duration::from_secs(1);
     let mut last_reason = String::new();
 
@@ -358,10 +360,8 @@ pub async fn run_cmd(a: RunArgs, cfg: &Config) -> i32 {
         env.push((TOKEN_ENV.to_string(), lock_token));
     }
     let reg_id = std::sync::Mutex::new(None::<String>);
-    let hold_owner = format!(
-        "corral:run:{}",
-        name.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect::<String>()
-    );
+    let hold_owner = corral_worker::keepawake::run_owner(&name, &run_id);
+    let gate = corral_worker::keepawake::HoldGate::default();
     let held = std::sync::atomic::AtomicBool::new(false);
     let renewer = std::sync::Mutex::new(None::<tokio::task::JoinHandle<()>>);
     let result = supervise(&a.cmd, &env, |pid| {
@@ -372,12 +372,13 @@ pub async fn run_cmd(a: RunArgs, cfg: &Config) -> i32 {
             match guard_call(&sock, "hold", fields.clone()) {
                 Ok(r) if r["ok"] == json!(true) => {
                     held.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let s = sock.clone();
+                    let (s, gate) = (sock.clone(), gate.clone());
                     *renewer.lock().unwrap() = Some(tokio::spawn(async move {
                         loop {
                             tokio::time::sleep(Duration::from_secs(30 * 60)).await;
-                            let (s, f) = (s.clone(), fields.clone());
-                            let _ = tokio::task::spawn_blocking(move || guard_call(&s, "hold", f)).await;
+                            let (s, f, gate) = (s.clone(), fields.clone(), gate.clone());
+                            // a renewal in flight at release time finishes before the release and nothing follows it (L2)
+                            let _ = tokio::task::spawn_blocking(move || gate.renew(|| guard_call(&s, "hold", f))).await;
                         }
                     }));
                 }
@@ -401,7 +402,7 @@ pub async fn run_cmd(a: RunArgs, cfg: &Config) -> i32 {
         t.abort();
     }
     if held.load(std::sync::atomic::Ordering::SeqCst) {
-        let _ = guard_call(&sock, "release_hold", json!({ "owner": hold_owner }));
+        let _ = gate.release(|| guard_call(&sock, "release_hold", json!({ "owner": hold_owner })));
     }
     if let Some(id) = reg_id.lock().unwrap().take() {
         let _ = guard_call(&sock, "unregister", json!({ "id": id }));

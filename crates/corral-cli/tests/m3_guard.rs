@@ -171,9 +171,17 @@ async fn run_hold_takes_and_releases_a_named_hold() {
     let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
     // the first call is the provider probe (`holds --json`) that admission makes
     let lines: Vec<&str> = calls.lines().filter(|l| l.starts_with("hold ") || l.starts_with("release")).collect();
-    assert!(lines[0].starts_with("hold --for 7800s --owner corral:run:my_build --pid "), "{calls}");
-    assert_eq!(lines.last(), Some(&"release --owner corral:run:my_build"), "{calls}");
+    assert!(lines[0].starts_with("hold --for 7800s --owner corral:run:my_build:"), "{calls}");
+    let owner = lines[0].split("--owner ").nth(1).unwrap().split(' ').next().unwrap().to_string();
+    assert_eq!(lines.last(), Some(&format!("release --owner {owner}").as_str()), "{calls}");
     assert!(!calls.contains("--all"));
+    // M3 (note 51): a second run of the same command has its own hold name, so neither can release the other's
+    let r = g.corral(&["run", "--name", "my build", "--hold", "--", "sh", "-c", "exit 0"]).await;
+    assert_eq!(r.code, 0, "{r:?}");
+    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+    let owners: std::collections::BTreeSet<&str> =
+        calls.lines().filter(|l| l.starts_with("hold ")).filter_map(|l| l.split("--owner ").nth(1)?.split(' ').next()).collect();
+    assert_eq!(owners.len(), 2, "two runs, two holds: {calls}");
     g.shutdown().await;
 }
 
