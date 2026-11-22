@@ -4,11 +4,14 @@ Rules for AI coding agents (and humans) working in this repo. Read it in full be
 
 ## Status
 
-The project is in its **design phase**. The specs in `docs/` are drafts under owner review.
+The specs in `docs/` were **approved by the owner on 22-Nov-2026**. **Milestone M1 is in progress** (scheduler,
+NATS, Linux worker, CLI, git/snapshot input, logs, events, artifacts: SPEC.md section 13). Later milestones (M2 and
+on) stay unimplemented until their turn; the round-2 drafts (exec, classifier, agent jobs, external tokens) are still
+drafts.
 
-- **No implementation work until the owner has approved the relevant spec.**
-- A spec you wrote yourself is not an approved spec.
-- If a task seems to need code, write or update the spec and stop.
+- Implement approved specs only, one milestone at a time, with tests that cite requirement IDs.
+- A spec you wrote yourself is not an approved spec. When code and spec disagree, change the spec first.
+- Where the spec is ambiguous, pick a sensible default and record it as a short "Implementation note" in the spec.
 
 ## What corral is
 
