@@ -47,6 +47,7 @@ impl SchedLink for Loopback {
     }
     async fn publish_log(&self, stream: &str, _job: &str, h: &LogHeaders, _p: Vec<u8>) -> Result<(), String> {
         self.logs.lock().unwrap().push((stream.to_string(), h.seq));
+        assert_eq!(h.stream, stream);
         Ok(())
     }
     async fn publish_progress(&self, _job: &str, _m: &ProgressMsg) {}

@@ -1,12 +1,10 @@
 //! `corral wait` and `corral logs`: follow a job's logs, progress and state over JetStream (R-IO-04).
 
 use crate::client::Client;
-use async_nats::jetstream::consumer::{DeliverPolicy, pull};
-use corral_proto::api::{JobEvent, ProgressMsg};
+use corral_proto::api::{FollowReq, JobEvent, ProgressMsg};
 use corral_proto::bus::unreachable_error;
 use corral_proto::envelope::ApiError;
 use corral_proto::job::{JobState, JobView};
-use corral_proto::subjects::{self, STREAM_EVENTS, STREAM_LOGS};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -82,71 +80,100 @@ pub fn final_line(j: &JobView) -> Option<String> {
     }
 }
 
+/// Subscribe to one stream's three delivery subjects, then ask the scheduler to start it. JetStream only delivers to
+/// a push consumer's delivery subject while someone is subscribed to that exact subject (a wildcard does not
+/// count), so each subject is subscribed on its own, before the request.
+async fn start_stream(
+    c: &Client,
+    id: &str,
+    base: &str,
+    n: u32,
+    subs: &mut futures::stream::SelectAll<async_nats::Subscriber>,
+) -> Result<(), ApiError> {
+    for kind in ["log", "ev", "prog"] {
+        let s = c
+            .bus
+            .client
+            .subscribe(format!("{base}.{n}.{kind}"))
+            .await
+            .map_err(|e| unreachable_error(format!("cannot follow {id}: {e}")))?;
+        subs.push(s);
+    }
+    let _: serde_json::Value =
+        c.bus.call_retry(&c.subject("follow"), &FollowReq { id: id.into(), deliver: format!("{base}.{n}") }, 3).await?;
+    Ok(())
+}
+
+/// How long a follower waits without any message before it asks for a fresh stream (the scheduler's consumers
+/// vanish when NATS restarts; sequence numbers make the replay idempotent). The wait doubles each time, so a job
+/// that is simply silent costs one replay per few minutes at most.
+const RESTART_AFTER: Duration = Duration::from_secs(10);
+const RESTART_AFTER_MAX: Duration = Duration::from_secs(160);
+
 /// Follow `id`. Returns the final job view when the job ended (or the current view when not following).
+///
+/// Logs, events and progress arrive through push consumers that the scheduler creates on the caller's behalf and
+/// that deliver into the caller's private inbox space; the caller never holds JetStream consumer permissions
+/// (R-SEC-02). The caller subscribes first, then asks, so nothing is delivered into the void.
 pub async fn follow(c: &Client, id: &str, opts: FollowOpts, sink: &mut dyn Sink) -> Result<JobView, ApiError> {
     let first = c.get(id).await?;
-    let js = &c.bus.js;
-    let bus_err = |e: &dyn std::fmt::Display| unreachable_error(format!("cannot follow {id}: {e}"));
-    let logs = js.get_stream(STREAM_LOGS).await.map_err(|e| bus_err(&e))?;
-    let events = js.get_stream(STREAM_EVENTS).await.map_err(|e| bus_err(&e))?;
-    let mk = |filter: String| pull::OrderedConfig { filter_subject: filter, deliver_policy: DeliverPolicy::All, ..Default::default() };
-    let mut log_msgs =
-        logs.create_consumer(mk(subjects::log_filter(id))).await.map_err(|e| bus_err(&e))?.messages().await.map_err(|e| bus_err(&e))?;
-    let mut ev_msgs =
-        events.create_consumer(mk(subjects::job_event(id))).await.map_err(|e| bus_err(&e))?.messages().await.map_err(|e| bus_err(&e))?;
-    let mut prog_msgs = events
-        .create_consumer(mk(subjects::progress_filter(id)))
-        .await
-        .map_err(|e| bus_err(&e))?
-        .messages()
-        .await
-        .map_err(|e| bus_err(&e))?;
+    let base = format!("{}.f{}", c.bus.identity.inbox_prefix(), corral_proto::util::random_b32(10));
+    let mut subs = futures::stream::SelectAll::new();
+    let mut stream_n = 1u32;
+    start_stream(c, id, &base, stream_n, &mut subs).await?;
 
     let mut cur_attempt = 0u32;
     let mut got: HashMap<(u32, String), u64> = HashMap::new();
     let mut ended: Option<(JobView, Instant)> = if first.state.is_terminal() { Some((first.clone(), Instant::now())) } else { None };
     let mut last_activity = Instant::now();
+    let mut last_msg = Instant::now();
     let mut last_progress = 0u8;
+    let mut restart_after = RESTART_AFTER;
 
     loop {
         tokio::select! {
-            Some(m) = log_msgs.next() => {
-                let Ok(m) = m else { continue };
+            Some(m) = subs.next() => {
                 last_activity = Instant::now();
-                let hdr = |k: &str| m.headers.as_ref().and_then(|h| h.get(k)).map(|v| v.as_str().to_string());
-                let (Some(attempt), Some(seq)) = (hdr("Corral-Attempt").and_then(|v| v.parse::<u32>().ok()), hdr("Corral-Seq").and_then(|v| v.parse::<u64>().ok())) else { continue };
-                if attempt < cur_attempt {
-                    continue; // an older attempt's output
-                }
-                if attempt > cur_attempt {
-                    if cur_attempt > 0 {
-                        sink.err(format!("corral: attempt {attempt} started (the earlier attempt was lost)\n").as_bytes());
+                last_msg = Instant::now();
+                restart_after = RESTART_AFTER;
+                let subject = m.subject.as_str();
+                // A push consumer delivers each message under its original subject.
+                if subject.starts_with("corral.log.") {
+                    let hdr = |k: &str| m.headers.as_ref().and_then(|h| h.get(k)).map(|v| v.as_str().to_string());
+                    let (Some(attempt), Some(seq), Some(stream)) = (
+                        hdr("Corral-Attempt").and_then(|v| v.parse::<u32>().ok()),
+                        hdr("Corral-Seq").and_then(|v| v.parse::<u64>().ok()),
+                        hdr("Corral-Stream"),
+                    ) else { continue };
+                    if attempt < cur_attempt {
+                        continue; // an older attempt's output
                     }
-                    cur_attempt = attempt;
-                }
-                let stream = subjects::parse_log(m.subject.as_str()).map(|(_, _, s)| s.to_string()).unwrap_or_default();
-                got.insert((attempt, stream.clone()), seq);
-                match stream.as_str() {
-                    "out" => sink.out(&m.payload),
-                    "err" => sink.err(&m.payload),
-                    "sys" if opts.sys => sink.err(&m.payload),
-                    _ => {}
-                }
-            }
-            Some(m) = ev_msgs.next() => {
-                let Ok(m) = m else { continue };
-                last_activity = Instant::now();
-                if let Ok(ev) = serde_json::from_slice::<JobEvent>(&m.payload)
-                    && JobState::parse(&ev.state).is_some_and(|s| s.is_terminal())
-                    && ended.is_none()
-                {
-                    let view = c.get(id).await?;
-                    ended = Some((view, Instant::now()));
-                }
-            }
-            Some(m) = prog_msgs.next() => {
-                let Ok(m) = m else { continue };
-                if let Ok(p) = serde_json::from_slice::<ProgressMsg>(&m.payload)
+                    if attempt > cur_attempt {
+                        if cur_attempt > 0 {
+                            sink.err(format!("corral: attempt {attempt} started (the earlier attempt was lost)\n").as_bytes());
+                        }
+                        cur_attempt = attempt;
+                    }
+                    if got.get(&(attempt, stream.clone())).is_some_and(|last| seq <= *last) {
+                        continue; // a replay after a restarted stream
+                    }
+                    got.insert((attempt, stream.clone()), seq);
+                    match stream.as_str() {
+                        "out" => sink.out(&m.payload),
+                        "err" => sink.err(&m.payload),
+                        "sys" if opts.sys => sink.err(&m.payload),
+                        _ => {}
+                    }
+                } else if subject.starts_with("corral.event.") {
+                    if let Ok(ev) = serde_json::from_slice::<JobEvent>(&m.payload)
+                        && JobState::parse(&ev.state).is_some_and(|s| s.is_terminal())
+                        && ended.is_none()
+                    {
+                        let view = c.get(id).await?;
+                        ended = Some((view, Instant::now()));
+                    }
+                } else if subject.starts_with("corral.progress.")
+                    && let Ok(p) = serde_json::from_slice::<ProgressMsg>(&m.payload)
                     && p.pct != last_progress
                 {
                     last_progress = p.pct;
@@ -164,6 +191,19 @@ pub async fn follow(c: &Client, id: &str, opts: FollowOpts, sink: &mut dyn Sink)
             }
         } else if !opts.follow && last_activity.elapsed() > Duration::from_millis(1200) {
             return c.get(id).await;
+        } else if opts.follow && last_msg.elapsed() > restart_after {
+            restart_after = (restart_after * 2).min(RESTART_AFTER_MAX);
+            // Quiet for a long time: the job may just be silent, or the scheduler's consumers may be gone (NATS
+            // restart). Ask again; replayed messages are skipped by sequence.
+            last_msg = Instant::now();
+            stream_n += 1;
+            if let Err(e) = start_stream(c, id, &base, stream_n, &mut subs).await {
+                tracing::debug!("could not restart the stream: {e}");
+            }
+            let view = c.get(id).await?;
+            if view.state.is_terminal() && ended.is_none() {
+                ended = Some((view, Instant::now()));
+            }
         }
     }
 }

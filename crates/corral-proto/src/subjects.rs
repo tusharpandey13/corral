@@ -42,6 +42,28 @@ pub fn progress_filter(id: &str) -> String {
     format!("corral.progress.*.{id}")
 }
 
+/// The only subject space the scheduler may answer into for a request received on `subject`: the caller's own
+/// inbox prefix (`_INBOX_<slug>.`). A reply subject outside it (a JetStream API subject, another identity's inbox)
+/// is ignored, so a caller cannot turn the scheduler into a confused deputy (R-SEC-02).
+pub fn reply_prefix(subject: &str) -> Option<String> {
+    use crate::ident::Identity;
+    let slug = if let Some(a) = parse_api(subject) {
+        a.who.to_string()
+    } else if let Some(w) = parse_work(subject) {
+        let worker = match w {
+            WorkSubject::Claim { worker } | WorkSubject::Heartbeat { worker, .. } | WorkSubject::Event { worker, .. } => worker,
+        };
+        Identity::Worker(worker.to_string()).slug()
+    } else {
+        return None;
+    };
+    Identity::from_slug(&slug).map(|id| format!("{}.", id.inbox_prefix()))
+}
+
+pub fn reply_allowed(subject: &str, reply: &str) -> bool {
+    reply_prefix(subject).is_some_and(|p| reply.starts_with(&p) && reply.len() > p.len() && !reply.contains(['*', '>', ' ']))
+}
+
 /// A parsed `corral.api.<who>.<verb>` subject.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ApiSubject<'a> {
@@ -87,6 +109,22 @@ pub fn parse_log(subject: &str) -> Option<(&str, &str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-SEC-02 (M1 review): the scheduler answers only into the caller's own inbox space.
+    #[test]
+    fn replies_go_only_to_the_callers_inbox() {
+        let api = "corral.api.agent-laptop.get";
+        assert!(reply_allowed(api, "_INBOX_agent-laptop.abc123"));
+        assert!(!reply_allowed(api, "$JS.API.STREAM.PURGE.CORRAL_LOGS"), "a JetStream API subject");
+        assert!(!reply_allowed(api, "_INBOX_owner.abc123"), "another identity's inbox");
+        assert!(!reply_allowed(api, "_INBOX_agent-laptop."), "no empty suffix");
+        assert!(!reply_allowed(api, "_INBOX_agent-laptop.>"), "no wildcards");
+        assert!(!reply_allowed(api, "corral.ctl.w1"));
+        assert!(reply_allowed("corral.work.w1.claim", "_INBOX_worker-w1.x"));
+        assert!(reply_allowed("corral.work.w1.j-1.hb", "_INBOX_worker-w1.x"));
+        assert!(!reply_allowed("corral.work.w1.claim", "_INBOX_worker-w2.x"));
+        assert!(!reply_allowed("corral.other.x", "_INBOX_worker-w1.x"));
+    }
 
     #[test]
     fn parses() {

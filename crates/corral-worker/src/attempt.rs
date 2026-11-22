@@ -288,7 +288,6 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
                 link: self.link.clone(),
                 job: id.clone(),
                 attempt,
-                lease: flags.token.clone(),
                 stream,
                 path,
                 spool_max: self.st.log_spool_max,

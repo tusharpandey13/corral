@@ -292,8 +292,10 @@ behaviour lives in the companion documents named per group.
 
 - **R-SEC-01** Every NATS connection authenticates (nkey); anonymous connections are refused. **AC:** anonymous
   connect fails.
-- **R-SEC-02** Each identity may publish and subscribe only on its own subjects. **AC:** a test tries every forbidden
-  publish/subscribe per identity; all fail.
+- **R-SEC-02** Each identity may publish and subscribe only on its own subjects. Clients hold no JetStream API
+  permission; the scheduler replies only into the caller's own inbox prefix. **AC:** a test tries every forbidden
+  publish/subscribe per identity (including consumer create/delete and purge); all fail; an agent's job output cannot
+  steer a worker, and a hostile reply subject gets no answer.
 - **R-SEC-03** The scheduler authorizes by the identity pinned in the subject; a payload `from` that disagrees is
   rejected. **AC:** mismatched `from` → `forbidden`.
 - **R-SEC-04** Every request schema has an optional `authz` field from v1; enabling approvals for an action changes
@@ -308,6 +310,8 @@ behaviour lives in the companion documents named per group.
   (CIBA) arrive in `authz` as before. nkeys keep working (`auth_users` bypass). **AC:** a valid token with a matching
   DPoP proof is accepted; a replayed proof (same `jti`), a proof signed by another key, a wrong audience and an expired
   token are each rejected with `forbidden`.
+- **Known limit (M1 review).** A job runs as the worker's OS user and can read the worker's nkey seed (PROTOCOL.md
+  12.1, "Known limits"); a separate unprivileged job user or a container/VM runtime is future work.
 - **R-SEC-06** NATS and HTTP listen only on configured addresses (default loopback + the private overlay address).
   **AC:** config validation rejects `0.0.0.0` unless `allow_public_bind = true`.
 
@@ -904,8 +908,11 @@ owner prefers otherwise.
     errs on the safe side; `phys_footprint` and PSS arrive with the guard.
 11. **Priority.** Non-exclusive heavy jobs run under `nice -n 10`. `ionice`, `cpu.weight`, `taskpolicy -b` and the
     per-attempt cgroup (R-EXEC-03, R-EXEC-04) are deferred; the budget watchdog applies everywhere.
-12. **Restart recovery (T-Q5).** A restarted worker does not adopt a live process group: it kills a group whose pid and
-    start time it recorded, then reports `lost_local`, so the fenced requeue applies and two attempts never overlap.
+12. **Restart recovery (T-Q5).** A restarted worker does not adopt a live process group. It kills everything the
+    attempt left behind, whether or not the recorded leader is still alive: members of the recorded group that started
+    no earlier than the leader and, on Linux, processes carrying the attempt's `CORRAL_JOB_ID`/`CORRAL_ATTEMPT`
+    (TERM, then KILL after `kill_grace`). Then it reports `lost_local`, so the fenced requeue applies and two attempts
+    never overlap.
 13. **Scheduler restart.** Replies to mutating requests are kept in SQLite for 10 minutes (idempotency survives a
     restart). Leases, the claim deadline and orphan times are extended by the measured downtime at start (R-OPS-03).
 14. **Events and the outbox.** Job events are published after the transaction commits, in order, retried until
@@ -916,3 +923,25 @@ owner prefers otherwise.
     `unavailable`), worker-local metrics (R-OPS-02, worker half), `corral config check` printing a source for every
     key (only the client keys carry one).
 
+### 17.1 Changes after the M1 review
+
+17. **Followers go through the scheduler** (R-SEC-02, R-IO-04). `follow` asks the scheduler to create push consumers
+    that deliver into the caller's inbox space; clients lost every `$JS.API` permission (PROTOCOL.md 8 and 12.1).
+    Chosen over a client-side consumer with a restricted subject filter (NATS permissions cannot constrain the consumer
+    configuration, only the API subject) and over a scheduler-side relay (one more copy of every byte, plus state per
+    follower): the server already does the delivery, ordering and cleanup. The `v` field is unchanged: `follow` is a
+    new verb and the log headers lost a field.
+18. **No lease token in log headers.** The sink accepts a chunk from the worker named in the log subject for the
+    job's current attempt; the token is not needed for that and must not be readable by followers.
+19. **Light jobs are never unlimited.** A light job without `ram_mb` is admitted and watched against
+    `worker.light_ram_default` (default 512M) times the slack.
+20. **The watchdog fails closed.** A process table that cannot be read, or reports an empty unit for a live job, is an
+    unknown footprint, not zero; five unknown one-second samples in a row stop the job as `ram_exceeded`.
+21. **Claim lifecycle.** A heartbeat revives an orphaned attempt to `claimed` when it never started (new transition,
+    PROTOCOL.md 5); the claim deadline also applies to such an orphan; a cancel that races with a decline, `lost_local`
+    or the claim deadline ends `cancelled`; claim requests are retried with the same `req_id`.
+22. **Attempts are keyed by (job, attempt)** in the worker (registry, admission table, lock owner `corral:<id>:<n>`),
+    and a lock file that does not parse is live for 10 s after its last write.
+23. **A log gap does not stall archiving** (PROTOCOL.md 8): recorded in the archive after `sink_hold_max` redeliveries.
+24. **Scheduler progress subscription.** The scheduler may subscribe to `corral.progress.>` (the template lacked it, so
+    `status` never showed progress).

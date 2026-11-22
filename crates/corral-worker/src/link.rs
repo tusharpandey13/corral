@@ -7,13 +7,16 @@ use corral_proto::envelope::ApiError;
 use corral_proto::subjects;
 use std::future::Future;
 
-/// Headers carried by every log chunk (PROTOCOL.md section 8).
+/// Headers carried by every log chunk (PROTOCOL.md section 8). There is deliberately no lease token: followers can
+/// read these headers, and a lease token must never be readable by anyone but the worker and the scheduler.
 #[derive(Debug, Clone)]
 pub struct LogHeaders {
     pub msg_id: String,
     pub seq: u64,
     pub attempt: u32,
-    pub lease: String,
+    /// `out`, `err` or `sys`: followers get logs through a push consumer, which delivers to a private subject, so
+    /// the stream name travels in a header too.
+    pub stream: String,
 }
 
 pub trait SchedLink: Send + Sync + 'static {
@@ -53,7 +56,7 @@ impl SchedLink for NatsLink {
         headers.insert("Nats-Msg-Id", h.msg_id.as_str());
         headers.insert("Corral-Seq", h.seq.to_string().as_str());
         headers.insert("Corral-Attempt", h.attempt.to_string().as_str());
-        headers.insert("Corral-Lease", h.lease.as_str());
+        headers.insert("Corral-Stream", h.stream.as_str());
         let ack = self
             .bus
             .js

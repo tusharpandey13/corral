@@ -383,14 +383,23 @@ pub struct SubmitOutcome {
     pub effects: Vec<Effect>,
 }
 
+/// The note written into an archived log where chunks `last+1 .. seq` never arrived.
+pub fn sink_gap_note(last: u64, seq: u64) -> Vec<u8> {
+    format!("\n[corral] log chunks {}..{} are missing (never arrived)\n", last + 1, seq - 1).into_bytes()
+}
+
 pub enum SinkDecision {
     /// Write the chunk at this byte offset, then call `sink_commit`.
     Write {
         offset: u64,
     },
     Duplicate,
-    /// A gap: redeliver later.
-    Hold,
+    /// A gap: redeliver later. `last` is the last sequence written and `offset` the file size, so the caller can
+    /// give up after a while and record the gap (`sink_gap_note`).
+    Hold {
+        last: u64,
+        offset: u64,
+    },
     Drop,
 }
 
@@ -1053,13 +1062,15 @@ impl Store {
 
     // ---- log sink (R-IO-03, U-25) ----
 
-    pub fn sink_decide(&mut self, id: &str, attempt: u32, stream: &str, seq: u64, lease: &str) -> Res<SinkDecision> {
+    pub fn sink_decide(&mut self, id: &str, attempt: u32, stream: &str, seq: u64, worker: &str) -> Res<SinkDecision> {
         let j = match load(&self.conn, id)? {
             Some(j) => j,
             None => return Ok(SinkDecision::Drop),
         };
-        // Token mismatch (a revoked attempt, a forged header): discard.
-        if j.token.as_deref() != Some(lease) || j.attempts != attempt {
+        // Only the worker that holds the attempt may append, and only to the attempt's own files: a revoked attempt
+        // (requeued, or another worker's) is discarded. The worker comes from the log subject, which a worker can
+        // only publish under its own name (R-SEC-02); no secret travels in the log headers.
+        if j.worker.as_deref() != Some(worker) || j.attempts != attempt {
             return Ok(SinkDecision::Drop);
         }
         let (last, bytes): (u64, u64) = self
@@ -1076,7 +1087,7 @@ impl Store {
         } else if seq <= last {
             SinkDecision::Duplicate
         } else {
-            SinkDecision::Hold
+            SinkDecision::Hold { last, offset: bytes }
         })
     }
 

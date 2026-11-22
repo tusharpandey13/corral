@@ -28,7 +28,7 @@ impl Client {
         Ok(Client { bus, http_url })
     }
 
-    fn subject(&self, verb: &str) -> String {
+    pub fn subject(&self, verb: &str) -> String {
         subjects::api(&self.bus.identity.slug(), verb)
     }
 

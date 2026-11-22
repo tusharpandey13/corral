@@ -61,6 +61,7 @@ Identity slugs: `scheduler`, `worker-<host>`, `agent-<host>`, `owner`. In payloa
 | `corral.api.<who>.get` | req/reply | client → scheduler | One job record incl. waiting reasons. |
 | `corral.api.<who>.list` | req/reply | client → scheduler | Filtered job list. |
 | `corral.api.<who>.workers` | req/reply | client → scheduler | Presence + admission summaries. |
+| `corral.api.<who>.follow` | req/reply | client → scheduler | `{"id", "deliver"}`: stream the job's logs, events and progress into `<deliver>.…` under the caller's own inbox prefix (§8). |
 | `corral.api.<who>.cancel` | req/reply | client → scheduler | Cancel own job (others: `owner`). |
 | `corral.api.<who>.resubmit` | req/reply | client → scheduler | New job from an old spec; `killed` → `owner` only. |
 | `corral.api.<who>.lease.open` / `.exec` / `.close` / `.list` | req/reply | client → scheduler | Interactive leases (§11). |
@@ -70,7 +71,7 @@ Identity slugs: `scheduler`, `worker-<host>`, `agent-<host>`, `owner`. In payloa
 | `corral.work.<w>.<id>.event` | req/reply | worker → scheduler | `started`, `declined`, `finished`, `artifacts`, `note`. |
 | `corral.ctl.<w>` | publish | scheduler → worker | `cancel`, `kill_stale`, `pause`, `resume`, `drain`, `kill_switch`. |
 | `corral.wake.<w>` | publish | scheduler → worker | "something you may take changed". |
-| `corral.log.<w>.<id>.<stream>` | JetStream publish | worker → `CORRAL_LOGS` | `stream` ∈ `out`, `err`, `sys` (corral notes). |
+| `corral.log.<w>.<id>.<stream>` | JetStream publish | worker → `CORRAL_LOGS` | `stream` ∈ `out`, `err`, `sys` (corral notes). Clients never read it directly (§8, §12.1). |
 | `corral.progress.<w>.<id>` | JetStream publish | worker → `CORRAL_EVENTS` | Progress. |
 | `corral.event.<id>` | JetStream publish | scheduler → `CORRAL_EVENTS` | State transitions (what `wait` follows). |
 | KV `corral_workers`, key `<w>` | KV put / watch | worker → scheduler, clients | Presence (§9). |
@@ -278,14 +279,28 @@ On `stale_lease` the worker kills the attempt's process group, discards unsent l
 - The worker writes child stdout/stderr to local files first (`runs/<id>/<attempt>/{out,err}`); they are the source
   of truth and the spool.
 - A publisher tails them and publishes chunks (≤ 64 KiB) to `corral.log.<w>.<id>.<stream>` with headers
-  `Nats-Msg-Id: <id>/<attempt>/<stream>/<seq>`, `Corral-Seq`, `Corral-Attempt`, `Corral-Lease`. It awaits publish
+  `Nats-Msg-Id: <id>/<attempt>/<stream>/<seq>`, `Corral-Seq`, `Corral-Attempt`, `Corral-Stream`. There is no lease
+  token in a log message: followers can read these headers, and the token is a secret between worker and scheduler. It awaits publish
   acks (≤ 64 in flight). While disconnected it pauses and resumes from the last acked seq.
 - Spool cap `log_spool_max` (512 MiB per attempt): beyond it the oldest unsent bytes are replaced by one
   `[corral] N bytes dropped` note; `finished.log_dropped_bytes` records it.
 - The scheduler's durable consumer appends to `<data_dir>/jobs/<id>/<attempt>.<stream>.log` only if
-  `seq = last + 1` and the lease token matches; it acks after the write (idempotent across redelivery).
-- Followers (`corral logs -f`, `corral wait`) use an ordered consumer on `corral.log.*.<id>.>` from the start; older
-  than stream retention → HTTP archive (§10).
+  `seq = last + 1` and the chunk comes from the worker (taken from the log subject, which a worker can only publish
+  under its own name) that holds the job's current attempt; it acks after the write (idempotent across redelivery). A
+  gap that is not filled after `sink_hold_max` redeliveries (default 30, about 30 s) is written into the archive as
+  `[corral] log chunks a..b are missing (never arrived)` and archiving moves on (R-IO-03).
+- **Followers** (`corral logs -f`, `corral wait`) do not touch JetStream. The client subscribes to the three literal
+  subjects `<deliver>.<n>.log`, `.ev` and `.prog` under its own inbox prefix (`<deliver>` = `_INBOX_<slug>.f<random>`),
+  then calls `corral.api.<who>.follow {"id", "deliver": "<deliver>.<n>"}`. The scheduler checks that `deliver` is a
+  plain subject under the caller's inbox prefix and creates three ephemeral push consumers (all messages, no acks,
+  `inactive_threshold` 30 s) that deliver the job's logs, job events and progress there; each message keeps its
+  original subject (`corral.log.…`, `corral.event.…`, `corral.progress.…`) and its `Corral-Seq`/`Corral-Attempt`/
+  `Corral-Stream` headers. JetStream delivers only to an exact subscription, hence one subscription per subject. A
+  follower that hears nothing for a while asks again with `<n>+1` (the consumers vanish when NATS restarts) and skips
+  sequence numbers it has seen. Older than stream retention → HTTP archive (§10). *Why:* a client that may create
+  JetStream consumers can aim a push consumer at any subject it may not publish to (a worker's `corral.ctl.<w>`),
+  or edit the scheduler's own `sink` consumer. The scheduler creates the consumers, so clients need no `$JS.API`
+  permission at all.
 - The `sys` stream carries corral's own notes about the attempt (admission, guard actions, SIGSTOP/SIGCONT,
   keep-awake, artifact upload).
 
@@ -396,18 +411,31 @@ NATS config-mode users with nkeys in account `CORRAL`; anonymous off (R-SEC-01).
 
 | Identity | publish allow | subscribe allow |
 |---|---|---|
-| `scheduler` | `corral.ctl.>`, `corral.wake.>`, `corral.event.>`, `$JS.API.>` (its streams), replies | `corral.api.>`, `corral.work.>`, `_INBOX_scheduler.>` |
+| `scheduler` | `corral.ctl.>`, `corral.wake.>`, `corral.event.>`, `$JS.API.>` (its streams), replies | `corral.api.>`, `corral.work.>`, `corral.progress.>`, `_INBOX_scheduler.>` |
 | `worker:<w>` | `corral.work.<w>.>`, `corral.log.<w>.>`, `corral.progress.<w>.>`, `$KV.corral_workers.<w>`, JetStream publish-ack paths | `corral.ctl.<w>`, `corral.wake.<w>`, `_INBOX_worker-<w>.>` |
-| `agent:<h>` | `corral.api.agent-<h>.>`, consumer-create on `CORRAL_LOGS`/`CORRAL_EVENTS` (ordered), KV get/watch on `corral_workers` | `_INBOX_agent-<h>.>`, `corral.event.>` |
-| `owner` | `corral.api.owner.>` plus the agent set | as agents |
+| `agent:<h>` | `corral.api.agent-<h>.>` only (no `$JS.API`: followers go through `follow`, §8) | `_INBOX_agent-<h>.>`, `corral.event.>` |
+| `owner` | `corral.api.owner.>` only | as agents |
 
-Exact `$JS.API` subject lists are fixed during implementation and covered by a test that attempts every forbidden
-publish/subscribe (R-SEC-02). Scheduler-side checks: a worker may only heartbeat/report attempts leased to it; a
+Exact subject lists are covered by a test that attempts every forbidden publish/subscribe (R-SEC-02), including the
+JetStream API (consumer create, update and delete, purge) for agents, the owner and workers. The scheduler answers a
+request only into the caller's own inbox prefix (`_INBOX_<slug>.` of the identity pinned by the request subject); a
+reply subject outside it is ignored, so a caller cannot make the scheduler publish onto a JetStream API subject.
+Control pushes name a lease token that must match the attempt (`cancel`, `kill_stale`). Scheduler-side checks: a worker may only heartbeat/report attempts leased to it; a
 client may cancel only jobs it submitted; `owner` may do anything. Every API request and transition is written to an
 `events` audit table with identity and subject.
 
-Limit: processes running as the same OS user can read the same seed file; such agents are one identity. Per-agent
-identity requires a credential broker (phase 2).
+Known limits:
+- Processes running as the same OS user can read the same seed file; such agents are one identity. Per-agent
+  identity requires a credential broker (phase 2).
+- **A job runs as the worker's OS user** (native runtime), so it can read that user's files, including the worker's
+  nkey seed, and thereby speak as `worker:<w>` (claim jobs, forge events for its own host's attempts). The permission
+  templates confine a stolen worker seed to that host's subjects, but they do not stop it. Running jobs as a
+  separate unprivileged user (or in a container or VM runtime) is future work; until then, keep the seed file mode
+  0600 and run only jobs you would run on that account.
+- Each `follow` creates three short-lived consumers; there is no per-identity quota yet.
+- Processes that `setsid` out of a job's group are tracked by a ppid walk everywhere and, on Linux, by the
+  `CORRAL_JOB_ID`/`CORRAL_ATTEMPT` environment they inherit; a job that deliberately scrubs its children's
+  environment and double-forks can still escape on Linux until the per-attempt cgroup (M2/M3) lands.
 
 ### 12.2 HTTP
 

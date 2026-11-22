@@ -736,21 +736,33 @@ fn waiting_text_is_per_worker() {
 
 // ---- U-25: log sink decisions ----
 
+/// R-IO-03 (M1 review): the note for a permanent gap names the missing chunk range.
 #[test]
-fn sink_accepts_only_the_next_seq_with_the_current_token() {
+fn gap_note_names_the_missing_range() {
+    let n = String::from_utf8(crate::store::sink_gap_note(4, 9)).unwrap();
+    assert!(n.contains("5..8"), "{n}");
+}
+
+#[test]
+fn sink_accepts_only_the_next_seq_from_the_attempts_worker() {
     use crate::store::SinkDecision::*;
     let r = rig();
     let id = r.submit(&heavy(10));
     let t = r.run_job("w", &[], &id);
     let mut st = r.svc.db();
-    assert!(matches!(st.sink_decide(&id, 1, "out", 1, &t).unwrap(), Write { offset: 0 }));
-    assert!(matches!(st.sink_decide(&id, 1, "out", 2, &t).unwrap(), Hold), "out of order is held");
+    let _ = t;
+    assert!(matches!(st.sink_decide(&id, 1, "out", 1, "w").unwrap(), Write { offset: 0 }));
+    assert!(matches!(st.sink_decide(&id, 1, "out", 3, "w").unwrap(), Hold { last: 0, offset: 0 }), "a gap is held");
     st.sink_commit(&id, 1, "out", 1, 100).unwrap();
-    assert!(matches!(st.sink_decide(&id, 1, "out", 1, &t).unwrap(), Duplicate), "redelivery is idempotent");
-    assert!(matches!(st.sink_decide(&id, 1, "out", 2, &t).unwrap(), Write { offset: 100 }));
-    assert!(matches!(st.sink_decide(&id, 1, "err", 1, &t).unwrap(), Write { offset: 0 }), "streams are independent");
-    assert!(matches!(st.sink_decide(&id, 1, "out", 2, "wrong-token").unwrap(), Drop), "R-QUEUE-06: stale token dropped");
-    assert!(matches!(st.sink_decide(&id, 2, "out", 1, &t).unwrap(), Drop), "wrong attempt dropped");
+    assert!(matches!(st.sink_decide(&id, 1, "out", 1, "w").unwrap(), Duplicate), "redelivery is idempotent");
+    assert!(matches!(st.sink_decide(&id, 1, "out", 2, "w").unwrap(), Write { offset: 100 }));
+    assert!(matches!(st.sink_decide(&id, 1, "out", 4, "w").unwrap(), Hold { last: 1, offset: 100 }));
+    assert!(matches!(st.sink_decide(&id, 1, "err", 1, "w").unwrap(), Write { offset: 0 }), "streams are independent");
+    assert!(
+        matches!(st.sink_decide(&id, 1, "out", 2, "other-worker").unwrap(), Drop),
+        "R-QUEUE-06 / R-SEC-02: another worker's chunks for this job are dropped"
+    );
+    assert!(matches!(st.sink_decide(&id, 2, "out", 1, "w").unwrap(), Drop), "wrong attempt dropped");
 }
 
 // ---- R-IO-05 retention ----

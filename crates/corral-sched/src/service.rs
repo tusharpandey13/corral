@@ -27,6 +27,8 @@ pub enum Out {
     Core { subject: String, payload: Vec<u8> },
     /// JetStream publish (stream captures the subject).
     Js { subject: String, payload: Vec<u8> },
+    /// Create the push consumers that stream one job to a follower (the NATS layer does it; followers cannot).
+    Follow { job: String, deliver: String },
 }
 
 #[derive(Default, Debug, Clone)]
@@ -245,6 +247,22 @@ impl Service {
                 encode_reply(&ListReply { jobs })
             }
             "workers" => self.workers(now)?,
+            "follow" => {
+                let r: FollowReq = body(value)?;
+                let prefix = format!("{}.", from.inbox_prefix());
+                let ok_chars = r.deliver.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                if !r.deliver.starts_with(&prefix)
+                    || r.deliver.len() > 120
+                    || !ok_chars
+                    || r.deliver.ends_with('.')
+                    || r.deliver.contains("..")
+                {
+                    return Err(ApiError::bad(format!("deliver must be a plain subject under {prefix}")).with("field", json!("deliver")));
+                }
+                self.db().get(&r.id).map_err(ApiError::from)?.ok_or_else(|| ApiError::not_found(format!("no job {}", r.id)))?;
+                self.send(Out::Follow { job: r.id, deliver: r.deliver });
+                encode_reply(&json!({ "ok": true }))
+            }
             "cancel" => self.cancel(from, env, value, now)?,
             "resubmit" => self.resubmit(from, env, value, now)?,
             "artifacts" => self.artifacts(from, value, now)?,

@@ -17,7 +17,6 @@ pub struct LogPublisher<L: SchedLink> {
     pub link: Arc<L>,
     pub job: String,
     pub attempt: u32,
-    pub lease: String,
     pub stream: &'static str,
     pub path: PathBuf,
     /// Unsent bytes beyond this are dropped and replaced by one note (R-IO-03, `log_spool_max`).
@@ -41,7 +40,7 @@ impl<L: SchedLink> LogPublisher<L> {
             msg_id: format!("{}/{}/{}/{}", self.job, self.attempt, self.stream, seq),
             seq,
             attempt: self.attempt,
-            lease: self.lease.clone(),
+            stream: self.stream.to_string(),
         };
         let mut delay = Duration::from_millis(200);
         // The same chunk with the same Nats-Msg-Id is retried until acked: nothing is lost while disconnected.
@@ -155,7 +154,6 @@ mod tests {
                 link: sink,
                 job: "j-1".into(),
                 attempt: 1,
-                lease: "t".into(),
                 stream: "out",
                 path,
                 spool_max: spool,

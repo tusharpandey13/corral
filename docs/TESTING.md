@@ -150,7 +150,7 @@ test's process tree (§10, `sandbox_scope`), so a real kill can only reach proce
 | IT-22 | HTTP token for job A cannot read job B; expired → 401 | R-SEC-05 |
 | IT-23 | `/metrics` and `/healthz` scrape; guard and worker local metrics | R-OPS-02 |
 | IT-24 | Scheduler stopped 5 min with a running job; restart; no job `orphaned` | R-OPS-03 |
-| IT-25 | Restart worker, scheduler, guard, NATS one at a time mid-job: never two attempts | R-OPS-01 |
+| IT-25 | Restart worker, scheduler, guard, NATS one at a time mid-job: never two attempts (worker restart also with the job leader dead and a group member alive) | R-OPS-01 |
 | IT-26 | `kill -9` the worker holding a lock → lock stale after ttl → next corral attempt takes over; nested `corral lock exec` re-enters | R-LOCK-03, R-LOCK-04 |
 | IT-27 | Keep-awake through a stub `hold-cli` provider: named hold, renew, release on every exit path; failing provider → `keepawake_unavailable` | R-AWAKE-01, R-AWAKE-03 |
 | IT-28 | Progress events reach a follower | R-IO-06 |

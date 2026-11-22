@@ -139,7 +139,13 @@ pub async fn run(
             while let Some(msg) = sub.next().await {
                 let reply = svc.handle(msg.subject.as_str(), &msg.payload);
                 if let Some(r) = msg.reply {
-                    let _ = client.publish(r, reply.into()).await;
+                    // Never answer outside the caller's own inbox space (R-SEC-02): a hostile reply subject such as a
+                    // JetStream API subject must not turn the scheduler into a confused deputy.
+                    if subjects::reply_allowed(msg.subject.as_str(), r.as_str()) {
+                        let _ = client.publish(r, reply.into()).await;
+                    } else {
+                        tracing::warn!("ignored a request on {} with a foreign reply subject", msg.subject);
+                    }
                 }
             }
         }));
@@ -151,6 +157,14 @@ pub async fn run(
         handles.push(tokio::spawn(async move {
             while let Some(out) = rx.recv().await {
                 match out {
+                    Out::Follow { job, deliver } => {
+                        let js = bus.js.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = create_follow_consumers(&js, &job, &deliver).await {
+                                tracing::warn!(%job, "cannot create follow consumers: {e}");
+                            }
+                        });
+                    }
                     Out::Core { subject, payload } => {
                         let _ = bus.client.publish(subject, payload.into()).await;
                     }
@@ -262,6 +276,30 @@ pub async fn run(
     Ok(Running { service: svc, http_addrs, bus, handles })
 }
 
+/// Three ephemeral push consumers (logs, job events, progress) that deliver into the follower's inbox space. They
+/// delete themselves once nobody listens any more (`inactive_threshold`).
+async fn create_follow_consumers(js: &jetstream::Context, job: &str, deliver: &str) -> Result<(), String> {
+    use async_nats::jetstream::consumer::{DeliverPolicy, push};
+    for (stream, filter, suffix) in [
+        (STREAM_LOGS, subjects::log_filter(job), "log"),
+        (STREAM_EVENTS, subjects::job_event(job), "ev"),
+        (STREAM_EVENTS, subjects::progress_filter(job), "prog"),
+    ] {
+        let s = js.get_stream(stream).await.map_err(|e| e.to_string())?;
+        s.create_consumer(push::Config {
+            deliver_subject: format!("{deliver}.{suffix}"),
+            filter_subject: filter,
+            ack_policy: AckPolicy::None,
+            deliver_policy: DeliverPolicy::All,
+            inactive_threshold: Duration::from_secs(30),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 async fn sink_loop(svc: &Arc<Service>, js: &jetstream::Context) -> Result<(), String> {
     let stream = js.get_stream(STREAM_LOGS).await.map_err(|e| e.to_string())?;
     let consumer = stream
@@ -281,37 +319,45 @@ async fn sink_loop(svc: &Arc<Service>, js: &jetstream::Context) -> Result<(), St
         let m = m.map_err(|e| e.to_string())?;
         let hdr = |k: &str| m.headers.as_ref().and_then(|h| h.get(k)).map(|v| v.as_str().to_string());
         let parsed = subjects::parse_log(m.subject.as_str()).map(|(w, id, s)| (w.to_string(), id.to_string(), s.to_string()));
-        let (Some((_w, id, stream_name)), Some(seq), Some(attempt), Some(lease)) = (
-            parsed,
-            hdr("Corral-Seq").and_then(|v| v.parse::<u64>().ok()),
-            hdr("Corral-Attempt").and_then(|v| v.parse::<u32>().ok()),
-            hdr("Corral-Lease"),
-        ) else {
+        let (Some((worker, id, stream_name)), Some(seq), Some(attempt)) =
+            (parsed, hdr("Corral-Seq").and_then(|v| v.parse::<u64>().ok()), hdr("Corral-Attempt").and_then(|v| v.parse::<u32>().ok()))
+        else {
             let _ = m.ack().await;
             continue;
         };
-        let decision = svc.db().sink_decide(&id, attempt, &stream_name, seq, &lease).map_err(|e| format!("{e:?}"))?;
-        match decision {
-            SinkDecision::Write { offset } => {
-                let dir = svc.jobs_dir().join(&id);
-                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .write(true)
-                    .open(dir.join(format!("{attempt}.{stream_name}.log")))
-                    .map_err(|e| e.to_string())?;
-                f.write_all_at(&m.payload, offset).map_err(|e| e.to_string())?;
-                f.sync_data().map_err(|e| e.to_string())?;
-                svc.db().sink_commit(&id, attempt, &stream_name, seq, offset + m.payload.len() as u64).map_err(|e| format!("{e:?}"))?;
-                let _ = m.ack().await;
+        let decision = svc.db().sink_decide(&id, attempt, &stream_name, seq, &worker).map_err(|e| format!("{e:?}"))?;
+        // A chunk to append: (offset, bytes). A gap that never fills is recorded and skipped after `sink_hold_max`
+        // redeliveries (about that many seconds), so one lost chunk cannot stall the archive of every job.
+        let write = match decision {
+            SinkDecision::Write { offset } => Some((offset, m.payload.to_vec())),
+            SinkDecision::Hold { last, offset } if m.info().is_ok_and(|i| i.delivered as u64 >= svc.settings.sink_hold_max) => {
+                tracing::warn!(job = %id, stream = %stream_name, "log chunks {}..{} never arrived; recording the gap", last + 1, seq - 1);
+                let mut bytes = crate::store::sink_gap_note(last, seq);
+                bytes.extend_from_slice(&m.payload);
+                Some((offset, bytes))
+            }
+            SinkDecision::Hold { .. } => {
+                let _ = m.ack_with(jetstream::AckKind::Nak(Some(Duration::from_secs(1)))).await;
+                None
             }
             SinkDecision::Duplicate | SinkDecision::Drop => {
                 let _ = m.ack().await;
+                None
             }
-            SinkDecision::Hold => {
-                let _ = m.ack_with(jetstream::AckKind::Nak(Some(Duration::from_secs(1)))).await;
-            }
+        };
+        if let Some((offset, bytes)) = write {
+            let dir = svc.jobs_dir().join(&id);
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(format!("{attempt}.{stream_name}.log")))
+                .map_err(|e| e.to_string())?;
+            f.write_all_at(&bytes, offset).map_err(|e| e.to_string())?;
+            f.sync_data().map_err(|e| e.to_string())?;
+            svc.db().sink_commit(&id, attempt, &stream_name, seq, offset + bytes.len() as u64).map_err(|e| format!("{e:?}"))?;
+            let _ = m.ack().await;
         }
     }
     Ok(())

@@ -29,7 +29,11 @@ async fn restart_with_dead_leader_kills_the_surviving_group_member() {
     let wd = tmpdir("w1");
     let w1 = start_worker(&nats, "w1", &s.http, &wd, |_| {}).await;
     let c = client(&nats, "agent:laptop", &s.http).await;
-    let id = c.submit(&spec(&["bash", "-c", "S=31777; sleep $S & if [ \"$CORRAL_ATTEMPT\" = 1 ]; then sleep 2; else sleep 30; fi; exit 0"]), None).await.unwrap().id;
+    let id = c
+        .submit(&spec(&["bash", "-c", "S=31777; sleep $S & if [ \"$CORRAL_ATTEMPT\" = 1 ]; then sleep 2; else sleep 30; fi; exit 0"]), None)
+        .await
+        .unwrap()
+        .id;
     until("running", 10, || async { c.get(&id).await.unwrap().state == JobState::Running }).await;
     until("child", 5, || async { !procs_matching("sleep 31777").is_empty() }).await;
     w1.worker.abort_all();
