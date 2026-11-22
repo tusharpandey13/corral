@@ -30,7 +30,6 @@ pub struct GuardCfg {
     pub restore_hooks: Vec<HookCfg>,
     #[serde(default)]
     pub locks: BTreeMap<String, LockCfg>,
-    /// Parsed now, used from M3.
     pub keepawake: Option<KeepAwakeCfg>,
     /// Directory the `disk_free` check measures (default: the guard's state directory).
     pub disk_path: Option<String>,
@@ -150,6 +149,13 @@ pub struct LockCfg {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeepAwakeCfg {
+    /// `hold-cli` (an external command implementing the hold contract) or `none` (always-on servers).
     pub provider: Option<String>,
+    /// The `hold-cli` command; default `awake` on `PATH`. Service environments have a minimal `PATH`, so a deployment
+    /// sets an absolute path here.
     pub command: Option<String>,
+    /// Work classes that need a working provider: `["heavy"]` refuses heavy work with `keepawake_unavailable` when the
+    /// provider probe fails (R-AWAKE-03). Default: none.
+    #[serde(default)]
+    pub required_for: Vec<String>,
 }

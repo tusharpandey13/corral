@@ -11,6 +11,7 @@ use crate::sample::{DiskProbe, Probes, Sample, run_cmd_owned};
 use crate::settings::GuardSettings;
 use crate::state::{Registration, StateDir, StopState};
 use corral_proto::util::{random_b32, rfc3339};
+use corral_worker::keepawake::{CachedProbe, KeepAwake};
 use corral_worker::lock::{FileLock, LockStatus, LockStore, SystemWall};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -81,6 +82,8 @@ pub struct Guard {
     clock: Arc<dyn Clock>,
     /// Enforce mode only: the one place that signals (`enforce.rs`).
     exec: Option<Executor>,
+    /// The keep-awake provider, and whether heavy work requires it (R-AWAKE-03).
+    keepawake: Option<(Arc<dyn KeepAwake>, bool, CachedProbe)>,
     inner: Mutex<Inner>,
     events: broadcast::Sender<String>,
 }
@@ -121,8 +124,11 @@ impl Guard {
                 tracing::warn!("resumed {n} process(es) a previous guard run had paused");
             }
         }
+        let keepawake = corral_worker::keepawake::from_config(settings.keepawake.as_ref())?
+            .map(|(p, req)| (p.clone(), req, CachedProbe::new(p, std::time::Duration::from_secs(15))));
         Ok(Guard {
             exec,
+            keepawake,
             inner: Mutex::new(Inner {
                 engine,
                 sample: Sample::default(),
@@ -145,6 +151,54 @@ impl Guard {
             clock: deps.clock,
             events,
         })
+    }
+
+    /// Replace the keep-awake provider (tests).
+    pub fn with_keepawake(mut self, p: Arc<dyn KeepAwake>, required: bool) -> Guard {
+        let probe = CachedProbe::new(p.clone(), std::time::Duration::from_millis(1));
+        self.keepawake = Some((p, required, probe));
+        self
+    }
+
+    /// `keepawake_ok` (GUARDS.md 7.1): the provider probe; `required` makes a failure refuse heavy work.
+    fn keepawake_check(&self) -> Option<(CheckResult, bool)> {
+        let (_, required, probe) = self.keepawake.as_ref()?;
+        Some(match probe.check() {
+            Ok(()) => (
+                CheckResult { check: "keepawake_ok".into(), ok: true, reason: "keep-awake provider works".into(), since_ms: None },
+                *required,
+            ),
+            Err(e) => (
+                CheckResult {
+                    check: "keepawake_unavailable".into(),
+                    ok: !*required,
+                    reason: format!("keep-awake provider unavailable: {e}"),
+                    since_ms: None,
+                },
+                *required,
+            ),
+        })
+    }
+
+    fn hold_op(&self, op: &str, req: &Value) -> Value {
+        let Some((p, _, _)) = &self.keepawake else {
+            return err("no keep-awake provider is configured ([guard.keepawake])");
+        };
+        let owner = req.get("owner").and_then(Value::as_str).unwrap_or("");
+        let res: Result<Value, String> = match op {
+            "hold" => {
+                let for_s = req.get("for_s").and_then(Value::as_u64).unwrap_or(0);
+                let bound = req.get("bound_pid").and_then(Value::as_u64).map(|p| p as u32);
+                let display = req.get("display").and_then(Value::as_bool).unwrap_or(false);
+                p.hold(owner, std::time::Duration::from_secs(for_s.max(1)), bound, display)
+                    .map(|h| json!({ "v": 1, "ok": true, "owner": h.owner, "pid": h.pid, "for_s": for_s }))
+            }
+            "release_hold" => p.release(owner).map(|()| json!({ "v": 1, "ok": true })),
+            _ => p.list().map(|l| {
+                json!({ "v": 1, "ok": true, "holds": l.iter().map(|h| json!({ "owner": h.owner, "until": h.until, "pid": h.pid, "bound_pid": h.bound_pid, "display": h.display })).collect::<Vec<_>>() })
+            }),
+        };
+        res.unwrap_or_else(|e| err(e))
     }
 
     /// Replace the executor (tests inject fake system calls). Enforce mode only.
@@ -328,6 +382,12 @@ impl Guard {
         let mut g = self.lock();
         g.reservations.retain(|r| r.until_ms > now);
         let mut results = self.with_ctx(&g, now, |c| admit::default_profile(c, &req));
+        if req.class == Class::Heavy
+            && let Some((r, _)) = self.keepawake_check()
+            && !r.ok
+        {
+            results.push(r);
+        }
         Self::annotate(&mut g, now, &mut results);
         let failing: Vec<&CheckResult> = results.iter().filter(|r| !r.ok).collect();
         let ok = failing.is_empty();
@@ -371,6 +431,9 @@ impl Guard {
             }),
             Some(p) => return err(format!("profile {p:?} is not available in this build (default or all)")),
         };
+        if let Some((r, _)) = self.keepawake_check() {
+            results.push(r);
+        }
         for (name, l) in &self.settings.locks {
             let lock = FileLock::new(l.path.clone(), Arc::new(SystemWall));
             let holder = lock.holder();
@@ -559,7 +622,7 @@ impl Guard {
             "lock.acquire" | "lock.renew" | "lock.release" => {
                 err("unavailable: take host locks with `corral lock` (the lease-file protocol); guard-held locks arrive with milestone M3")
             }
-            "hold" | "release_hold" | "holds" => err("unavailable: keep-awake holds arrive with milestone M3"),
+            op @ ("hold" | "release_hold" | "holds") => self.hold_op(op, req),
             "subscribe" => err("subscribe is a streaming request"),
             other => err(format!("unknown op {other:?}")),
         }

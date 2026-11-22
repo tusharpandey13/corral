@@ -53,6 +53,7 @@ pub struct GuardSettings {
     pub admit_max_c: f64,
     pub sensor: Option<(String, String)>,
     pub zone: Option<PathBuf>,
+    pub keepawake: Option<corral_proto::guardcfg::KeepAwakeCfg>,
 }
 
 fn is_root() -> bool {
@@ -175,6 +176,7 @@ impl GuardSettings {
             never,
             hooks,
             locks,
+            keepawake: g.keepawake.clone(),
         })
     }
 

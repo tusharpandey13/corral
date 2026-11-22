@@ -207,6 +207,51 @@ impl KeepAwake for HoldCli {
     }
 }
 
+/// Build the configured provider (`[guard.keepawake]`). No section = no provider. Returns the provider and whether
+/// heavy work requires it to work (R-AWAKE-03).
+pub fn from_config(cfg: Option<&corral_proto::guardcfg::KeepAwakeCfg>) -> Result<Option<(Arc<dyn KeepAwake>, bool)>, String> {
+    let Some(c) = cfg else { return Ok(None) };
+    for w in &c.required_for {
+        if w != "heavy" {
+            return Err(format!("guard.keepawake.required_for: {w:?} is not \"heavy\""));
+        }
+    }
+    let required = !c.required_for.is_empty();
+    let p: Arc<dyn KeepAwake> = match c.provider.as_deref().unwrap_or("hold-cli") {
+        "hold-cli" => Arc::new(HoldCli::new(c.command.clone().unwrap_or_else(|| "awake".into()))),
+        "none" => Arc::new(NoKeepAwake),
+        o @ ("caffeinate" | "systemd-inhibit") => {
+            return Err(format!("guard.keepawake.provider {o:?} is not built yet; use \"hold-cli\" or \"none\""));
+        }
+        o => return Err(format!("guard.keepawake.provider: {o:?} is not hold-cli or none")),
+    };
+    Ok(Some((p, required)))
+}
+
+/// A probe result cached for a few seconds: admission asks often, the provider is an external command.
+pub struct CachedProbe {
+    provider: Arc<dyn KeepAwake>,
+    ttl: Duration,
+    last: Mutex<Option<(Instant, Result<(), String>)>>,
+}
+
+impl CachedProbe {
+    pub fn new(provider: Arc<dyn KeepAwake>, ttl: Duration) -> CachedProbe {
+        CachedProbe { provider, ttl, last: Mutex::new(None) }
+    }
+    pub fn check(&self) -> Result<(), String> {
+        let mut l = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((t, r)) = &*l
+            && t.elapsed() < self.ttl
+        {
+            return r.clone();
+        }
+        let r = self.provider.probe();
+        *l = Some((Instant::now(), r.clone()));
+        r
+    }
+}
+
 /// For tests and always-on servers: `none` provider (no holds, always available) and a recording fake.
 pub struct NoKeepAwake;
 
