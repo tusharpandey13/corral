@@ -326,7 +326,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         let started = Instant::now();
         let timeout = Duration::from_secs(job.spec.timeout_s);
         let grace = Duration::from_millis(self.st.kill_grace_ms);
-        let budget = (job.spec.ram() as f64 * self.st.budget_slack) as u64;
+        let budget = (self.ram_for(&job.spec) as f64 * self.st.budget_slack) as u64;
         let mut cause: Option<Cause> = None;
         let mut term_at: Option<Instant> = None;
         let mut kill_sent = false;
@@ -353,7 +353,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
                         peak = peak.max(s.footprint_mb);
                         flags.footprint_mb.store(s.footprint_mb, Ordering::SeqCst);
                         self.adm.update_footprint(&id, s.footprint_mb);
-                        if budget > 0 && s.footprint_mb > budget {
+                        if s.footprint_mb > budget {
                             cause = Some(Cause::RamExceeded);
                         }
                     }

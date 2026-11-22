@@ -64,6 +64,15 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         self.adm.running_ids()
     }
 
+    /// RAM the job is admitted and watched against: what it declared, else `light_ram_default` (a light job may omit
+    /// `ram_mb`, but it is never unlimited).
+    pub(crate) fn ram_for(&self, spec: &corral_proto::job::JobSpec) -> u64 {
+        match spec.ram() {
+            0 => self.st.light_ram_default_mb,
+            r => r,
+        }
+    }
+
     fn claim_req(&self) -> ClaimReq {
         let (slots, admission) = self.adm.summary();
         let info = self.rt.describe();
@@ -109,7 +118,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
             let need = Need {
                 id: job.id.clone(),
                 class: job.spec.class,
-                ram_mb: job.spec.ram(),
+                ram_mb: self.ram_for(&job.spec),
                 lock: job.spec.lock.clone(),
                 pid: std::process::id(),
             };

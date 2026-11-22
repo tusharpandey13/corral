@@ -14,6 +14,8 @@ pub struct WorkerSettings {
     pub ram_cap_mb: Option<u64>,
     /// Memory that must stay available after a job's declared RAM. `None` = 20% of total RAM.
     pub admit_floor_mb: Option<u64>,
+    /// RAM a light job without `ram_mb` is admitted and watched against: no job runs unlimited.
+    pub light_ram_default_mb: u64,
     pub work_dir: PathBuf,
     pub http_url: String,
     pub kill_grace_ms: u64,
@@ -41,6 +43,7 @@ impl WorkerSettings {
             light_slots: 2,
             ram_cap_mb: None,
             admit_floor_mb: None,
+            light_ram_default_mb: 512,
             lock_path: work_dir.join("locks/heavy.lock"),
             work_dir,
             http_url: http_url.into(),
@@ -78,6 +81,9 @@ impl WorkerSettings {
         }
         s.ram_cap_mb = w.admissible_ram_cap.as_deref().and_then(|v| parse_size_mb(v).ok());
         s.admit_floor_mb = w.admit_floor.as_deref().and_then(|v| parse_size_mb(v).ok());
+        if let Some(m) = w.light_ram_default.as_deref().and_then(|v| parse_size_mb(v).ok()).filter(|m| *m > 0) {
+            s.light_ram_default_mb = m;
+        }
         let dur = |v: &Option<String>, d: u64| v.as_deref().and_then(|x| parse_duration_ms(x).ok()).unwrap_or(d);
         s.kill_grace_ms = dur(&w.kill_grace, s.kill_grace_ms);
         s.keep_failed_ms = dur(&w.keep_failed_runs, s.keep_failed_ms);

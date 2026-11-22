@@ -78,6 +78,8 @@ pub enum Behavior {
     Hang,
     /// Die from a signal nobody in corral sent (OOM killer, `kill -9` by someone else).
     ExternalSignal { after_ms: u64 },
+    /// Run until KILLed: TERM is ignored.
+    IgnoreTerm,
     /// Grow beyond the declared RAM, then hang.
     Grow { footprint_mb: u64 },
 }
@@ -86,6 +88,7 @@ pub struct FakeState {
     exit: Mutex<Option<ExitInfo>>,
     notify: Notify,
     footprint: Mutex<u64>,
+    ignore_term: bool,
 }
 
 pub struct FakeRunning {
@@ -134,8 +137,10 @@ impl Runtime for FakeRuntime {
         let (out, err) = (ctx.run_dir.join("stdout"), ctx.run_dir.join("stderr"));
         std::fs::write(&err, "").map_err(|e| RuntimeError::Other(e.to_string()))?;
         std::fs::write(&out, "").map_err(|e| RuntimeError::Other(e.to_string()))?;
-        let st = Arc::new(FakeState { exit: Mutex::new(None), notify: Notify::new(), footprint: Mutex::new(1) });
-        match (self.behavior)(&ctx.spec) {
+        let behavior = (self.behavior)(&ctx.spec);
+        let ignore_term = matches!(behavior, Behavior::IgnoreTerm);
+        let st = Arc::new(FakeState { exit: Mutex::new(None), notify: Notify::new(), footprint: Mutex::new(1), ignore_term });
+        match behavior {
             Behavior::Exit { code, after_ms, stdout } => {
                 let (st2, out2) = (st.clone(), out.clone());
                 tokio::spawn(async move {
@@ -144,7 +149,7 @@ impl Runtime for FakeRuntime {
                     st2.finish(ExitInfo { code: Some(code), signal: None, by_runtime: None });
                 });
             }
-            Behavior::Hang => {}
+            Behavior::Hang | Behavior::IgnoreTerm => {}
             Behavior::ExternalSignal { after_ms } => {
                 let st2 = st.clone();
                 tokio::spawn(async move {
@@ -168,6 +173,7 @@ impl Runtime for FakeRuntime {
     fn signal(&self, r: &FakeRunning, sig: UnitSignal) -> Result<(), RuntimeError> {
         self.signals.lock().unwrap().push(sig);
         match sig {
+            UnitSignal::Term if r.st.ignore_term => {}
             UnitSignal::Term => r.st.finish(ExitInfo { code: None, signal: Some(15), by_runtime: None }),
             UnitSignal::Kill => r.st.finish(ExitInfo { code: None, signal: Some(9), by_runtime: None }),
             _ => {}

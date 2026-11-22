@@ -110,6 +110,8 @@ pub struct WorkerCfg {
     pub admissible_ram_cap: Option<String>,
     /// Memory that must stay available after a job's declared RAM (admission floor). Default: 20% of RAM.
     pub admit_floor: Option<String>,
+    /// RAM a light job that declares none is admitted and watched against (default 512M); never unlimited.
+    pub light_ram_default: Option<String>,
     pub work_dir: Option<String>,
     pub runtime: Option<String>,
     pub cost_tier: Option<u32>,
@@ -241,6 +243,7 @@ impl Config {
             for (key, v) in [
                 ("worker.admissible_ram_cap", &w.admissible_ram_cap),
                 ("worker.admit_floor", &w.admit_floor),
+                ("worker.light_ram_default", &w.light_ram_default),
                 ("worker.log_spool_max", &w.log_spool_max),
             ] {
                 if let Some(v) = v {

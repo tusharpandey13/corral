@@ -618,6 +618,7 @@ policy.require_grant = []              # e.g. ["exclusive", "resubmit_killed", "
 caps = ["macos", "arm64", "metal", "gpu", "android"]
 slots = { heavy = 1, light = 2 }
 admissible_ram_cap = "12G"            # never claim more than this, whatever is free
+light_ram_default = "512M"            # RAM a light job without ram_mb is admitted and watched against
 work_dir = "$HOME/Library/Application Support/corral"
 runtime = "native"
 keepawake_required_for = ["heavy"]
