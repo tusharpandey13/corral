@@ -413,7 +413,7 @@ NATS config-mode users with nkeys in account `CORRAL`; anonymous off (R-SEC-01).
 |---|---|---|
 | `scheduler` | `corral.ctl.>`, `corral.wake.>`, `corral.event.>`, `$JS.API.>` (its streams), replies | `corral.api.>`, `corral.work.>`, `corral.progress.>`, `_INBOX_scheduler.>` |
 | `worker:<w>` | `corral.work.<w>.>`, `corral.log.<w>.>`, `corral.progress.<w>.>`, `$KV.corral_workers.<w>`, JetStream publish-ack paths | `corral.ctl.<w>`, `corral.wake.<w>`, `_INBOX_worker-<w>.>` |
-| `agent:<h>` | `corral.api.agent-<h>.>` only (no `$JS.API`: followers go through `follow`, §8) | `_INBOX_agent-<h>.>`, `corral.event.>` |
+| `agent:<h>` | `corral.api.agent-<h>.>` only (no `$JS.API`: followers go through `follow`, §8) | `_INBOX_agent-<h>.>` only (events arrive through `follow`) |
 | `owner` | `corral.api.owner.>` only | as agents |
 
 Exact subject lists are covered by a test that attempts every forbidden publish/subscribe (R-SEC-02), including the
@@ -421,7 +421,7 @@ JetStream API (consumer create, update and delete, purge) for agents, the owner 
 request only into the caller's own inbox prefix (`_INBOX_<slug>.` of the identity pinned by the request subject); a
 reply subject outside it is ignored, so a caller cannot make the scheduler publish onto a JetStream API subject.
 Control pushes name a lease token that must match the attempt (`cancel`, `kill_stale`). Scheduler-side checks: a worker may only heartbeat/report attempts leased to it; a
-client may cancel only jobs it submitted; `owner` may do anything. Every API request and transition is written to an
+client may cancel or `follow` (logs, events, progress) only jobs it submitted; `owner` may do anything. Every API request and transition is written to an
 `events` audit table with identity and subject.
 
 Known limits:
