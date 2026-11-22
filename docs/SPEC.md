@@ -829,7 +829,7 @@ working tree; keep-awake holds; a queue that tolerates workers offline for days.
 - **Q13. Phase-2 budget model:** monthly cap per owner vs per-job cap only (RUNTIMES.md §4).
 - **Q14. IO-heavy concurrency cap:** is an `io_heavy` flag plus `io_slots` (R-SCHED-05a) the right shape, or should it be a
   generic named-resource slot (`slots = { heavy = 1, light = 2, io = 1 }`)? Proposed: generic named slots.
-- **Q15. Exec workdir default** (R-REXEC-04): same-path `mirror` (commands with absolute paths work; refuses on
+- **Q15. (decided: `mirror` where roots are configured, else `scratch`) Exec workdir default** (R-REXEC-04): same-path `mirror` (commands with absolute paths work; refuses on
   foreign changes) vs `scratch` (never touches the worker user's checkout). Proposed: `mirror` where roots are
   configured, else `scratch`.
 - **Q16. Hook decision when the target is offline and the command is `unknown`:** run locally under guard (proposed)
