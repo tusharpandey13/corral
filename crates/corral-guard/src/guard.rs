@@ -86,6 +86,9 @@ pub struct Guard {
     keepawake: Option<(Arc<dyn KeepAwake>, bool, CachedProbe)>,
     inner: Mutex<Inner>,
     events: broadcast::Sender<String>,
+    /// Held for a whole decision round and by `shutdown`; `true` once shut down. A round that was in flight when the
+    /// server stopped cannot STOP anything after shutdown has continued what was paused (L7).
+    rounds: Mutex<bool>,
 }
 
 fn err(msg: impl Into<String>) -> Value {
@@ -155,6 +158,7 @@ impl Guard {
             resolver: deps.resolver,
             clock: deps.clock,
             events,
+            rounds: Mutex::new(false),
         })
     }
 
@@ -214,6 +218,9 @@ impl Guard {
 
     /// Orderly shutdown: continue anything this guard paused.
     pub fn shutdown(&self) {
+        // waits for a round in flight, and stops later rounds from acting
+        let mut down = self.rounds.lock().unwrap_or_else(|e| e.into_inner());
+        *down = true;
         if let Some(x) = &self.exec {
             x.resume_all_paused();
         }
@@ -279,6 +286,10 @@ impl Guard {
 
     /// One decision round from already-read inputs (tests feed these directly).
     pub fn tick_with(&self, sample: Sample, table: Option<Vec<ProcInfo>>, protect: HashMap<String, Protect>) {
+        let down = self.rounds.lock().unwrap_or_else(|e| e.into_inner());
+        if *down {
+            return;
+        }
         let now = sample.t_ms;
         let stop = self.state.stop();
         let mut g = self.lock();

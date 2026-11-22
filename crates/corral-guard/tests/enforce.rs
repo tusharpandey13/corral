@@ -240,3 +240,18 @@ fn shutdown_continues_paused_units_and_keeps_what_it_cannot_check() {
     rig.guard.shutdown();
     assert!(rig.sys.signals().contains(&("group".into(), 4243, Sig::Cont)));
 }
+
+/// L7 / note 45: once the guard has shut down, a decision round that was still on its way cannot STOP anything
+/// (shutdown has just continued what was paused).
+#[test]
+fn a_round_after_shutdown_signals_nothing() {
+    let rig = Rig::enforcing_fake(PAUSABLE);
+    rig.sys.starts.lock().unwrap().insert(4244, "Mon Nov 22 10:00:00 2026".into());
+    *rig.procs.table.lock().unwrap() = vec![fake_proc(4244, "wk-job")];
+    rig.guard.shutdown();
+    rig.set_free_pct(21.0);
+    for _ in 0..4 {
+        rig.tick();
+    }
+    assert!(rig.sys.signals().is_empty(), "{:?}", rig.sys.signals());
+}

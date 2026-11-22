@@ -428,10 +428,7 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         let kill_like = exit.signal.is_some() || matches!(exit.code, Some(137 | 143));
         if cause.is_none() && exit.by_runtime.is_none() && kill_like {
             let mut waited = 0;
-            while self.adm.guard().is_some()
-                && flags.guard_kill.lock().unwrap_or_else(|e| e.into_inner()).is_none()
-                && waited < 30
-            {
+            while self.adm.guard().is_some() && flags.guard_kill.lock().unwrap_or_else(|e| e.into_inner()).is_none() && waited < 30 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 waited += 1;
             }
