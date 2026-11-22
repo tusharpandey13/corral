@@ -383,23 +383,29 @@ behaviour lives in the companion documents named per group.
   `||`, `|`, newlines and `(`; backslash-newline joins; unquoted `#` comments dropped; leading `VAR=x`, `sudo`, `env`,
   `command`, `time`, `nohup` skipped; `bash|sh|zsh -c STR` parsed; heredoc bodies and quoted text never match; `cd DIR`
   updates the effective cwd of later segments; `ssh HOST CMD` payloads classified too) and assigns each segment a class
-  from configured rules: `local_only`, `local_ok`, `heavy`, `unknown`. **AC:** golden corpus test including `cd x &&
-  npm test | tail` (heavy), a heredoc mentioning a test runner (not heavy), `bash -lc "cargo build"` (heavy).
+  from configured rules: `local_only`, `local_ok`, or `remote` with a **heaviness level** `weight` 1-3 (1 light, 2
+  medium, 3 heavy). A segment no rule matches is `remote` at `default_weight` (default 1) and is marked `unknown` in
+  the log. A command's weight is the maximum over its segments. **AC:** golden corpus test including `cd x && npm test
+  | tail` (weight 3), a heredoc mentioning a test runner (not remote), `bash -lc "cargo build"` (weight 3), an
+  unmatched command (weight = `default_weight`, logged unknown).
 - **R-PLACE-02** Combination: the command stays local only if every segment is `local_ok` or `local_only`; a command
-  mixing `local_only` with `heavy`/`unknown` segments is denied with a reason naming both (it cannot be split).
+  mixing `local_only` with `remote` segments is denied with a reason naming both (it cannot be split).
   **AC:** table test.
 - **R-PLACE-03** **Hook mode** (`corral hook <harness>`): reads the harness's pre-tool event, classifies, and answers
   in the harness's format: run locally; **rewrite** the command to `corral exec --on W ...` (recommended mode);
-  **deny** with a reason (alternative mode); or, when W is offline, **queue** heavy commands as a job and return at once
-  with exit 75 and the reason, and run `unknown` commands locally under guard (`corral local --guard`: timeout,
-  low CPU/IO weight, memory cap). Every decision is logged. An `observe` mode logs the decision and changes nothing.
+  **deny** with a reason (alternative mode); or, when W is offline: a command whose weight is at or above
+  `wait_threshold` (default 2) is **queued** as a job for W and the call returns at once with exit 75 and the reason;
+  a command below it runs locally under guard (`corral local --guard`: timeout, low CPU/IO weight, memory cap).
+  **AC (thresholds):** offline W, weight 1 → guarded local; weight 2 and 3 → queued; changing `wait_threshold` to 3
+  moves weight 2 to guarded local. Every decision is logged. An `observe` mode logs the decision and changes nothing.
   **AC:** for each decision a fixture event produces the expected harness output; observe mode never changes input.
 - **R-PLACE-04** Presence for hook decisions is read from a local cache (`corral workers --watch`), so a decision
   makes no network call; p95 decision time < 50 ms. **AC:** benchmark over the golden corpus.
 - **R-PLACE-05** Escape hatch: a configured marker comment (default `# @local`) or `corral local --reason TEXT -- CMD`
   runs locally (guard limits without the timeout) and is logged with the reason. **AC:** marker honoured and logged.
 - **R-PLACE-06** The rules file is data; corral never edits it. `corral classify --propose` reads the decision log and
-  writes a proposal diff (patterns that ran locally under guard, fast and small); applying it is the owner's act.
+  writes a proposal diff (patterns that ran locally under guard, fast and small, proposed as `local_ok`; patterns
+  killed by the guard timeout, proposed one weight higher); applying it is the owner's act.
   **AC:** proposal written; rules file unchanged.
 - **R-PLACE-07** A per-project profile (`light`, `build-heavy`, `media-device`) may be supplied by an external
   provider (a file or command) and selects rule sets; corral does not store profiles. **AC:** profile switches a rule
@@ -832,14 +838,14 @@ working tree; keep-awake holds; a queue that tolerates workers offline for days.
 - **Q15. (decided: `mirror` where roots are configured, else `scratch`) Exec workdir default** (R-REXEC-04): same-path `mirror` (commands with absolute paths work; refuses on
   foreign changes) vs `scratch` (never touches the worker user's checkout). Proposed: `mirror` where roots are
   configured, else `scratch`.
-- **Q16. Hook decision when the target is offline and the command is `unknown`:** run locally under guard (proposed)
-  vs queue like heavy.
-- **Q17. Harness rewrite semantics** [unverified]: whether a pre-tool hook's input rewrite must be paired with an
+- **Q16. (decided: heaviness levels with a wait threshold, R-PLACE-01/03)** Hook decision when the target is
+  offline: weight ≥ `wait_threshold` waits for W, below runs locally under guard.
+- **Q17. (owner: test it before hook mode ships; one combined hook in the meantime) Harness rewrite semantics** [unverified]: whether a pre-tool hook's input rewrite must be paired with an
   "allow" decision (bypassing the harness's own permission rules) and how several rewriting hooks combine. Proposed:
   one hook entry point that can chain other rewriters, until verified.
 - **Q18. Agent runner contract:** command template (proposed) vs a runtime adapter of its own.
-- **Q19. DPoP over NATS** [unverified as a standard profile]: DPoP proofs bind an HTTP method and URL; for the NATS
+- **Q19. (decided: HTTP DPoP first in phase 2, NATS profile after review) DPoP over NATS** [unverified as a standard profile]: DPoP proofs bind an HTTP method and URL; for the NATS
   auth callout corral would define `htm = "CONNECT"`, `htu = "nats://<server>/corral"`. Proposed: HTTP DPoP per RFC
   9449 in phase 2 first, NATS profile after review.
-- **Q20. Exec class default:** classify from the classifier's segment classes (`heavy` → heavy) (proposed) or always
+- **Q20. (decided: the classifier decides; weight ≥ `heavy_threshold`, default 3, gets heavy admission) Exec class default:** classify from the classifier's segment classes (`heavy` → heavy) (proposed) or always
   light unless `--class heavy`.
