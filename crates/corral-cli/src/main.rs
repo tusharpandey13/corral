@@ -3,7 +3,7 @@ use corral_cli::args::*;
 use corral_cli::client::Client;
 use corral_cli::exitcode;
 use corral_cli::follow::{FollowOpts, StdSink, exit_code_for, final_line, follow};
-use corral_cli::{daemon, render, submit};
+use corral_cli::{daemon, guardcmd, lockcmd, render, submit};
 use corral_proto::api::AdminReq;
 use corral_proto::bus::read_seed;
 use corral_proto::config::{ClientCfg, Config};
@@ -98,6 +98,27 @@ async fn run(cli: Cli) -> i32 {
                 }
             };
         }
+        Cmd::Guard(GuardCmd::Run) => {
+            init_logging();
+            let settings = match corral_guard::settings::GuardSettings::from_config(&cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("corral guard: {e}");
+                    return exitcode::USAGE;
+                }
+            };
+            return match corral_guard::server::run(settings, daemon::wait_for_signal()).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("corral guard: {e}");
+                    1
+                }
+            };
+        }
+        Cmd::Guard(g) => return guardcmd::guard_cmd(g.clone(), &cfg),
+        Cmd::Admit(a) => return guardcmd::admit_cmd(a.clone(), &cfg),
+        Cmd::Run(a) => return lockcmd::run_cmd(a.clone(), &cfg).await,
+        Cmd::Lock(l) => return lockcmd::lock_cmd(l.clone(), &cfg).await,
         Cmd::Config(ConfigCmd::Check { file }) => {
             let target = file.clone().or(cfg_path);
             return match target {

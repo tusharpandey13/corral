@@ -56,7 +56,7 @@ pub async fn run_worker(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
-async fn wait_for_signal() {
+pub async fn wait_for_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
         std::future::pending::<()>().await;

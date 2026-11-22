@@ -73,6 +73,17 @@ pub enum Cmd {
     Scheduler,
     /// Run the worker daemon.
     Worker,
+    /// The per-host guard: daemon, status, kill switch, decision comparison.
+    #[command(subcommand)]
+    Guard(GuardCmd),
+    /// Ask the local guard whether a heavy (or light) unit may start now. Exit 0 admitted, 1 refused, 2 usage,
+    /// 5 guard unreachable (treat as refused).
+    Admit(AdmitArgs),
+    /// Run a command under the guard: admit with a reservation, take the lock, re-check under it, register, run.
+    Run(RunArgs),
+    /// Host locks (the lease-file protocol shared with the legacy lock tool).
+    #[command(subcommand)]
+    Lock(LockCmd),
     /// Validate a configuration file and print the effective settings.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -91,6 +102,145 @@ pub enum Cmd {
         #[arg(long = "user", required = true)]
         users: Vec<String>,
     },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum GuardCmd {
+    /// Run the guard daemon (observe mode: decisions are logged, nothing is signalled).
+    Run,
+    /// Level, signals, watched units, registrations, reservations, locks, kill switch, last actions.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// The last decisions with their inputs: why would (or did) the guard act, and why not.
+    Explain {
+        #[arg(short, default_value_t = 20)]
+        n: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Kill switch on: kill all watched work (observe mode: recorded only) and refuse all admission.
+    Stop {
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Kill switch off.
+    Resume {
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Prometheus text of the guard's metrics.
+    Metrics,
+    /// Compare the guard's decisions with a legacy guard's log (migration phase G0). Exit 1 if a legacy action has
+    /// no matching corral decision.
+    Compare {
+        /// The legacy guard's log: one `YYYY-MM-DD HH:MM:SS message` line per event.
+        #[arg(long)]
+        legacy: PathBuf,
+        /// Decision log (default: the guard's own `decisions.jsonl` and its first rotation).
+        #[arg(long)]
+        ours: Option<PathBuf>,
+        /// Matching window in seconds.
+        #[arg(long, default_value_t = 10)]
+        window: u64,
+        /// The legacy log's UTC offset, `+01:00` (default: this host's).
+        #[arg(long)]
+        utc_offset: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct AdmitArgs {
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Declared RAM: 4G, 512M.
+    #[arg(long)]
+    pub ram: Option<String>,
+    #[arg(long, default_value = "heavy")]
+    pub class: String,
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Hold the RAM and the heavy slot for this long (60s) or until a registration presents the token.
+    #[arg(long)]
+    pub reserve: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+    /// The legacy scripts' output: `ok` / `refused: <reason>`, and exit 1 when the guard is unreachable.
+    #[arg(long)]
+    pub legacy_output: bool,
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct RunArgs {
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub ram: Option<String>,
+    #[arg(long, default_value = "heavy")]
+    pub class: String,
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// A configured host lock (`[guard.locks.NAME]`) to hold while the command runs.
+    #[arg(long)]
+    pub lock: Option<String>,
+    #[arg(long)]
+    pub tier: Option<u32>,
+    /// Memory budget of the command (default: --ram x 1.1).
+    #[arg(long)]
+    pub budget: Option<String>,
+    /// Hold the machine awake while it runs (keep-awake holds arrive with milestone M3).
+    #[arg(long)]
+    pub hold: bool,
+    /// Keep retrying admission and the lock for up to this long (1s doubling to 15s).
+    #[arg(long)]
+    pub wait: Option<String>,
+    #[arg(last = true, required = true)]
+    pub cmd: Vec<String>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum LockCmd {
+    /// Take the lock now or fail (exit 1, naming the holder).
+    Acquire(LockArgs),
+    /// Take the lock, waiting for it.
+    Wait(LockArgs),
+    /// Refresh the heartbeat (holder only).
+    Renew(LockArgs),
+    /// Release (holder only).
+    Release(LockArgs),
+    Status(LockArgs),
+    /// Hold the lock around a command: renew while it runs, release on every exit path.
+    Exec(LockArgs),
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct LockArgs {
+    /// A configured lock name (`[guard.locks.NAME]`).
+    pub name: Option<String>,
+    /// A lock file instead of a configured name.
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+    #[arg(long)]
+    pub agent: Option<String>,
+    #[arg(long)]
+    pub purpose: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    pub apps: Vec<String>,
+    /// Seconds before the lock is stale without a heartbeat.
+    #[arg(long)]
+    pub ttl: Option<u64>,
+    /// `wait`: give up after this long (default: wait for ever).
+    #[arg(long)]
+    pub timeout: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(last = true)]
+    pub cmd: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
