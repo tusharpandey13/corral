@@ -141,6 +141,30 @@ The worker admits it against its `agent` slot (presence `slots.agent_free`), cre
 `exchange_remote` at `base_sha`, runs the configured runner, and on exit pushes `branch` to `exchange_remote`. It then
 sends the attempt event `agent_result` (§6.4) before `finished`.
 
+### 4.2 Job profile instances (draft, round 3; SPEC §4.17)
+
+A job, exec step, lease step or agent job sent to a worker with `job_profiles = "required"` carries:
+
+```json
+{ "job_profile": {"id": "npm-test", "rev": 2, "digest": "sha256:..."}, "lease_s": 900 }
+```
+
+- `cmd` must be an argv array; a shell string (which the CLI would wrap as `bash -lc`) is refused for profile
+  instances. `cwd` is relative to the runner workspace.
+- `lease_s` ≤ the profile's `limits.max_lease_s`; it is the attempt timeout (`timeout_s` is ignored for instances).
+- `env` names must pass the profile's `env.allow` and the built-in deny list (SPEC R-JPROF-03).
+- `secrets` cannot be named (`secrets: none` in this draft); no message ever carries a secret value (R-JPROF-16).
+- Decline checks: `job_profile` (no profile named on a `required` worker), `profile_not_installed` (unknown id, rev or
+  digest), `profile_digest_mismatch` (the launcher's installed copy differs), `profile_expired` (`valid_until`
+  passed), `deps_missing` (hydrate could not install from the shared cache; exit 75 with a hint),
+  `cache_config_override` (a workspace file would redirect a shared store).
+
+Profile verbs (client → scheduler, `corral.api.<who>.profiles.*`): `request {detail}` (starts the approval; returns
+the approval request id), `list`, `show {id, render: bool}`, `disable {id}` (never gated). Scheduler → worker control
+(`corral.ctl.<w>`): `profile_install {detail, artefact}` and `profile_remove {id}`; the worker writes them to the
+installer inbox unchanged and reports the outbox result in presence. Cache events (attempt events, §6.4):
+`cache_reject {store, entry, owner_profile}` from an import, and `cache_corrupt {store, entry, owner_profile}` from GC.
+
 ## 5. Job state machine
 
 States: `uploading`, `queued`, `claimed`, `running`, `orphaned` (non-terminal); `succeeded`, `failed`, `killed`,
@@ -192,7 +216,8 @@ States: `uploading`, `queued`, `claimed`, `running`, `orphaned` (non-terminal); 
 ### 5.2 Kill reasons (closed set, extend only with a `v`-compatible addition)
 
 `ram_exceeded`, `system_memory`, `thermal`, `kill_switch`, `timeout`, `external_signal`, `oom_kernel`,
-`stale_lease`, `lease_killed` (a step's lease was killed). The worker also reports `reason: "cancelled"` for its own
+`stale_lease`, `lease_killed` (a step's lease was killed). Round 3 adds `profile_revoked` (a profile was
+disabled or revoked while an instance ran; a deliberate stop, SPEC R-JPROF-11). The worker also reports `reason: "cancelled"` for its own
 cancel kills; the scheduler maps that to state `cancelled`, not `killed`.
 
 ## 6. Claims, attempt leases, heartbeats, fencing
@@ -325,6 +350,10 @@ published as events with `state` unchanged.
   "paused":null, "kill_switch":false, "t":"..." }
 ```
 
+Round 3 (SPEC §4.17): a worker with `job_profiles = "required"` adds
+`"job_profiles": [{"id": "npm-test", "rev": 2, "digest": "sha256:...", "prefix": ["npm", "test"], "max_lease_s": 1800,
+"valid_until": "..."}]`, which the hook's local cache reads (R-PLACE-04).
+
 A key not refreshed for 60 s expires; watchers see the purge and show `offline since <t>`.
 
 **Wake.** `corral.wake.<w>`: `{"v":1, "reason":"queued|cancelled|lease_step|resume", "job":"<id>"}`. Published when a
@@ -402,6 +431,10 @@ patch of changed tracked and untracked-not-ignored files, uploads it with the pu
 and sends `sync_back` (§6.4). The client applies the patch only if `git apply --check` passes on its tree.
 The session is closed by `lease.close`, by `idle_s`, or when the caller's connection has been gone for `idle_s`.
 
+Round 3: on a `required` worker, `lease.open` (kind `exec`) carries `job_profile`; `workdir` must be `"workspace"`
+(`mirror` is refused, SPEC R-REXEC-04 note), and the session is keyed by (caller session, repository root, profile).
+`dirty_foreign` cannot occur there. The base commit reaches the runner as a `git bundle` sent by the worker.
+
 ## 12. Authentication and authorization
 
 ### 12.1 v1: nkeys and per-subject permissions
@@ -431,7 +464,9 @@ Known limits:
   nkey seed, and thereby speak as `worker:<w>` (claim jobs, forge events for its own host's attempts). The permission
   templates confine a stolen worker seed to that host's subjects, but they do not stop it. Running jobs as a
   separate unprivileged user (or in a container or VM runtime) is future work; until then, keep the seed file mode
-  0600 and run only jobs you would run on that account.
+  0600 and run only jobs you would run on that account. **Round 3:** resolved on workers with
+  `job_profiles = "required"`: instances run as a per-profile runner that cannot read the worker's home (SPEC
+  R-JPROF-07).
 - Each `follow` creates three short-lived consumers; there is no per-identity quota yet.
 - Processes that `setsid` out of a job's group are tracked by a ppid walk everywhere and, on Linux, by the
   `CORRAL_JOB_ID`/`CORRAL_ATTEMPT` environment they inherit; a job that deliberately scrubs its children's
@@ -490,3 +525,9 @@ Capability tokens (§10). Phase 2 adds externally issued JWTs.
 The harness adapters translate it: a rewrite becomes the harness's input-update output, a deny its deny output with
 `reason`, `local` and `observe` produce no change. The log never stores the command text when it matches the secret
 deny-list; `command_sha256` is kept instead.
+
+Round 3 (SPEC R-JPROF-13): with `placement.job_profiles = "required"`, `decision` gains `light_local` (a light
+`unknown` segment in the light envelope) and `refused`; `guarded_local` is no longer produced for heavy segments.
+A refusal records `"profile_miss": {"shape": "cargo bench", "weight": 3, "repo_key": "name", "target_online": true}`
+(shape built by the R-JPROF-12 rules; never the command text) and the deny `reason` names the shape and how to request
+a profile. A rewrite names the profile: `corral exec --on laptop --profile npm-test --cwd sub --lease 900 -- npm test`.

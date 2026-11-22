@@ -120,6 +120,12 @@ Other matcher keys:
   and tells the local worker to report affected jobs `killed:kill_switch`.
 - `corral guard resume`: clears it. Both are logged and notified. The scheduler's `admin kill_switch` forwards to every
   online guard; offline guards get it on reconnect (sticky until `resume`).
+- **Round 3 (draft, SPEC R-JPROF-18): approval levels.** With external authorization configured, the directions
+  differ: switching the kill switch **on**, pausing and draining are level 0 (they only stop or hold work); switching it
+  **off**, `corral guard stop`, `resume` after a guard stop, and the scheduler's `kill_stale` are **unsafe admin**,
+  level 3 by default (per-request approval on the approver's strongest channel), and config cannot set them below 2.
+  The local socket's `stop` and `resume` are unchanged; the levels apply where the request enters corral (CLI and
+  scheduler), so a local administrator keeps a way to stop a host.
 
 ### 3.5 Restore hooks
 
@@ -243,6 +249,12 @@ The worker keeps a `subscribe` stream open; that is how it learns that the guard
 why (R-GUARD-08). Registrations persist in the guard's state file and are re-validated by pid start time after a guard
 restart; a worker that reconnects re-sends its live registrations (idempotent by `(pgid, pid_start)`).
 
+**Round 3 (draft, SPEC R-JPROF-17): guard separation.** The guard runs as its own user and service, separate from the
+scheduler and the worker: no bus credentials, no network, only this socket, process visibility, and signal rights
+only in enforce mode. On a worker with `job_profiles = "required"` the socket group must include the worker's user
+and the per-profile launchers (they register instance process groups); runners themselves are not members, so a job
+cannot call `stop`, `resume` or `lock.*` for other work.
+
 ## 7. Checks, profiles, re-check under lock, explainable waits
 
 ### 7.1 Checks
@@ -294,6 +306,10 @@ own admission) checks only `kill_switch_off` and `memory` (projection under the 
 
 Custom profiles are lists of checks with parameters (SPEC.md §9). A legacy "dev" mode (skip idle and media) is the
 `default` profile plus `lock_free`.
+
+**Not to be confused with job profiles** (SPEC §4.17): the profiles in this section are admission check lists; a job
+profile is an approved description of what may run on a worker and as which user. An instance of a job profile still
+names an admission profile through its `admission` field (`light` or `heavy` class under `default`).
 
 ### 7.3 Idle, two stages, synthetic input
 
