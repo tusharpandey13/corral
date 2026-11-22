@@ -116,7 +116,8 @@ async fn put_input(State(svc): State<S>, Path(upload): Path<String>, headers: He
         return status(StatusCode::BAD_REQUEST, "uploaded bytes do not match the declared sha256 and size");
     }
     let now = svc.now();
-    match svc.db().upload_verified(&upload, now) {
+    let verified = svc.db().upload_verified(&upload, now); // the lock must be released before `emit` takes it again
+    match verified {
         Ok(fx) => {
             svc.emit(fx);
             status(StatusCode::OK, "ok")

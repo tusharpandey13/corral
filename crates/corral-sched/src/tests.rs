@@ -797,3 +797,63 @@ fn counters_follow_kills_and_declines() {
     assert_eq!(c.kills.get("timeout"), Some(&1));
     assert_eq!(c.claims.get("job"), Some(&1));
 }
+
+// ---- E-06 / E-12 pieces ----
+
+/// PROTOCOL.md 7.4: a cancel for an attempt whose worker is offline ends `cancelled` after the grace period
+/// (not `lost`, not requeued).
+#[test]
+fn cancel_while_the_worker_is_offline_ends_cancelled_after_grace() {
+    let r = rig();
+    let id = r.submit(&heavy(10));
+    r.run_job("w", &[], &id);
+    r.clock.advance_s(91);
+    r.tick();
+    assert_eq!(r.get(&id).state, JobState::Orphaned);
+    let c: CancelReply = r.api(&agent(), "cancel", &CancelReq { id: id.clone(), reason: None }).unwrap();
+    assert!(c.cancel_requested);
+    r.clock.advance_s(16 * 60);
+    r.tick();
+    assert_eq!(r.get(&id).state, JobState::Cancelled);
+    assert_eq!(r.get(&id).attempts, 1);
+}
+
+/// E-12: `lock = none` on a heavy job is owner-only.
+#[test]
+fn lock_none_is_owner_only() {
+    let r = rig();
+    let mut s = heavy(10);
+    s.lock = "none".into();
+    assert_eq!(r.api::<_, SubmitReply>(&agent(), "submit", &s).unwrap_err().error, ErrorCode::Forbidden);
+    assert!(r.api::<_, SubmitReply>(&Identity::Owner, "submit", &s).is_ok());
+}
+
+/// E-06: cancelling a queued job and a `claimed` job (before `started`).
+#[test]
+fn cancel_in_queued_and_claimed_states() {
+    let mut r = rig();
+    let q = r.submit(&heavy(10));
+    let cq: CancelReply = r.api(&agent(), "cancel", &CancelReq { id: q.clone(), reason: None }).unwrap();
+    assert_eq!((cq.state.as_str(), cq.cancel_requested), ("cancelled", false));
+    let c = r.submit(&heavy(10));
+    let claim = r.claim("w", &r.claim_req(&[], 1, 1000));
+    assert_eq!(claim.job.unwrap().id, c);
+    let cc: CancelReply = r.api(&agent(), "cancel", &CancelReq { id: c.clone(), reason: None }).unwrap();
+    assert!(cc.cancel_requested, "a claimed job is stopped through the worker");
+    assert!(r.drain().iter().any(|o| matches!(o, Out::Core { subject, .. } if subject == "corral.ctl.w")));
+}
+
+#[test]
+fn heartbeats_keep_a_slow_claim_alive() {
+    let r = rig();
+    let id = r.submit(&heavy(10));
+    let c = r.claim("w", &r.claim_req(&[], 1, 1000));
+    let t = c.lease_token.unwrap();
+    for _ in 0..4 {
+        r.clock.advance_s(60);
+        r.hb("w", &id, &t).unwrap();
+        r.tick();
+    }
+    let j = r.get(&id);
+    assert_eq!((j.state, j.attempts), (JobState::Claimed, 1), "four minutes of input fetching with heartbeats is not an abandoned claim");
+}

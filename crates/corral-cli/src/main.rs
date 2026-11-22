@@ -172,7 +172,7 @@ async fn run(cli: Cli) -> i32 {
         Err(e) => return fail(&e),
     };
     match cli.cmd {
-        Cmd::Submit(a) => submit_cmd(&client, a).await,
+        Cmd::Submit(a) => submit_cmd(&client, *a).await,
         Cmd::Wait { id } => match follow(&client, &id, FollowOpts { follow: true, sys: false }, &mut StdSink).await {
             Ok(j) => {
                 if let Some(l) = final_line(&j) {

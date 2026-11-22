@@ -167,3 +167,47 @@ pub async fn follow(c: &Client, id: &str, opts: FollowOpts, sink: &mut dyn Sink)
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corral_proto::job::JobSpec;
+
+    fn view(state: JobState, code: Option<i32>) -> JobView {
+        JobView {
+            id: "j-1".into(),
+            state,
+            kind: "command".into(),
+            spec: JobSpec::simple(&["true"]),
+            submitter: "agent:laptop".into(),
+            attempts: 1,
+            worker: None,
+            reason: None,
+            exit_code: code,
+            detail: None,
+            created_at: "2026-11-22T00:00:00Z".into(),
+            queued_at: None,
+            started_at: None,
+            finished_at: None,
+            waiting: vec![],
+            cancel_requested: false,
+            artifacts_state: None,
+            log_final: Default::default(),
+            retry_of: None,
+            progress: None,
+        }
+    }
+
+    /// U-21 / R-IO-04: `wait` exits with the job's code, and 125 for killed, lost, cancelled and expired.
+    #[test]
+    fn wait_exit_codes() {
+        assert_eq!(exit_code_for(&view(JobState::Succeeded, Some(0))), 0);
+        assert_eq!(exit_code_for(&view(JobState::Failed, Some(3))), 3);
+        assert_eq!(exit_code_for(&view(JobState::Failed, None)), 125, "a failure without an exit code (input) is not 0");
+        for s in [JobState::Killed, JobState::Lost, JobState::Cancelled, JobState::Expired] {
+            assert_eq!(exit_code_for(&view(s, None)), 125, "{s:?}");
+        }
+        assert!(final_line(&view(JobState::Succeeded, Some(0))).is_none());
+        assert!(final_line(&view(JobState::Killed, None)).unwrap().contains("killed"));
+    }
+}

@@ -1,6 +1,6 @@
 # corral: guards, admission, host locks, keep-awake
 
-Status: **draft for owner review (v0.1, 22-Nov-2026).** Companion to `docs/SPEC.md` (requirement IDs `R-*` refer
+Status: **approved by the owner (v0.1, 22-Nov-2026); round-2 drafts excepted.** Companion to `docs/SPEC.md` (requirement IDs `R-*` refer
 there). This document specifies `corral guard`, the one per-host daemon that replaces a pile of one-off scripts: a
 macOS memory killer with kill tiers, a Linux memory/thermal shedder with a protected set and restore hooks, a JSON
 lease-file host lock, a measurement queue's idle/AC/lock/media/thermal/TCC checks and device lock, and a keep-awake

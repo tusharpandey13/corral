@@ -722,6 +722,9 @@ impl Store {
             j.orphaned_at = None;
         }
         j.lease_until = Some(now + st.lease_ttl_ms);
+        if j.state == JobState::Claimed {
+            j.claimed_at = Some(now); // a live worker that is still fetching its input has not abandoned the claim
+        }
         save(&tx, &j)?;
         tx.commit()?;
         Ok(HbOutcome { lease_until: now + st.lease_ttl_ms, cancel: j.cancel_requested, effects: fx })
@@ -737,7 +740,11 @@ impl Store {
             && j.worker.as_deref() == Some(worker)
             && j.token.as_deref() == Some(token)
         {
-            j.artifacts_state = Some(state.clone());
+            // The HTTP side records `uploaded` and `refused` itself; a later `none` (e.g. a transport error after
+            // an early 413) must not erase that.
+            if !(state == "none" && j.artifacts_state.is_some()) {
+                j.artifacts_state = Some(state.clone());
+            }
             save(&tx, &j)?;
             tx.commit()?;
             return Ok(vec![]);

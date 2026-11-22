@@ -1,6 +1,6 @@
 # corral: test strategy, end-to-end scenarios and chaos rubric
 
-Status: **draft for owner review (v0.1, 22-Nov-2026). Nothing is built and nothing here has been run.** Companion to
+Status: **approved by the owner (v0.1, 22-Nov-2026); round-2 drafts excepted. Milestone M1's unit and integration tests exist (section 12); the end-to-end and chaos scenarios have not been run.** Companion to
 `docs/SPEC.md` (requirement IDs `R-*`), `docs/PROTOCOL.md`, `docs/GUARDS.md` and `docs/RUNTIMES.md`. It is the
 "end-to-end and chaos rubric (owed)" named in SPEC.md §13 and the milestone exit criteria the rollout refers to.
 
@@ -695,3 +695,34 @@ by release builds:
   live runs entirely in each deployment's private runbooks?
 - **T-Q7. macOS CI.** End-to-end on a real macOS runner for the macOS-only paths (proposed), or fake macOS probes on
   Linux only until M3?
+
+## 12. Implementation status (M1)
+
+Unit tests live next to the code (`crates/*/src`, `crates/corral-worker/tests/`); integration tests are
+`crates/corral-cli/tests/m1_*.rs` against a real `nats-server`. Each test names the requirement IDs it proves.
+
+| Rubric ID | Where it is covered |
+|---|---|
+| U-01 | `corral-proto` `state::tests` (every state/event pair; terminal states are final) |
+| U-02 | `corral-sched` `tests::claim_selection_table`, `ordering_priority_then_fifo_with_backfill`, `prefer_then_fallback_with_a_fake_clock`, `fifty_parallel_claims_for_ten_jobs_give_ten_distinct_winners` (R-SCHED-06 at the service level) |
+| U-03 | `corral-worker` `admission::tests::projection_boundary_is_exact` (worker-side projection; the guard's arrives in M2) |
+| U-11 | `corral-worker` `admission::tests::recheck_under_the_lock_declines_and_releases` |
+| U-16 | `corral-proto` `config::tests` |
+| U-17 | `corral-proto` `token::tests` |
+| U-18 | `corral-cli` `snapshot::tests` |
+| U-19 | `corral-proto` `progress::tests`, `corral-worker` `logs::tests` |
+| U-20 | `corral-sched` `tests::lease_*`, `grace_*`, `not_after_*`, `downtime_extends_leases` |
+| U-21 | `corral-cli` `exitcode::tests`, `follow::tests` (the `wait` half; `admit` and `lock` codes arrive with M2 and M3) |
+| U-22 | `corral-sched` `tests::require_grant_policy`, `corral-proto` `envelope::tests` |
+| U-23 | `corral-worker` `attempt::tests`, `tests/fake_runtime.rs` |
+| U-24 | `corral-worker` `tests/fake_runtime.rs::pause_on_exit_pauses_the_worker` |
+| U-25 | `corral-sched` `tests::sink_accepts_only_the_next_seq_with_the_current_token`, `corral-worker` `logs::tests` |
+| U-26 | `corral-worker` `tests/fake_runtime.rs` |
+| IT-01..IT-02, IT-04..IT-06 | `m1_core.rs::submit_with_no_worker_is_fast_and_queued`, `m1_resilience.rs` |
+| IT-07 | service level, see U-02 |
+| IT-12, IT-13, IT-16..IT-19 | `m1_core.rs`, `m1_resilience.rs::nats_restart_mid_job_loses_no_log_bytes` |
+| IT-21..IT-25 | `m1_security.rs`, `m1_resilience.rs` |
+| IT-03 (worker watchdog variant) | `m1_core.rs::memory_hog_is_killed_ram_exceeded` (the guard variant is M3) |
+| E-01, E-04, E-06, E-12 | approximated in-process (`m1_core.rs`, `corral-sched` `tests::cancel_*`, `lock_none_is_owner_only`); the three-host topology of section 5 is not built |
+| CH-* | not automated in M1 |
+

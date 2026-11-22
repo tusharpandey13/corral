@@ -25,7 +25,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Queue a command to run on a worker.
-    Submit(SubmitArgs),
+    Submit(Box<SubmitArgs>),
     /// Follow a job: live logs on stdout/stderr, exit with the job's exit code (125 if it was killed, lost,
     /// cancelled or expired).
     Wait { id: String },

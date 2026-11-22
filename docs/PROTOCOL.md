@@ -1,6 +1,6 @@
 # corral: protocol
 
-Status: **draft for owner review (v0.1, 22-Nov-2026).** Companion to `docs/SPEC.md` (requirement IDs `R-*` refer
+Status: **approved by the owner (v0.1, 22-Nov-2026); round-2 drafts excepted.** Companion to `docs/SPEC.md` (requirement IDs `R-*` refer
 there). Covers the NATS subjects and schemas between CLI, scheduler and workers, the job state machine, leases and
 fencing, cancel, logs and progress, presence, interactive leases, and the HTTP API for bulk bytes. The local protocol
 between worker/CLI and the guard is in `docs/GUARDS.md` §6.

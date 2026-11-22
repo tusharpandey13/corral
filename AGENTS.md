@@ -56,6 +56,9 @@ The product summary is in `README.md`; the specs are in `docs/`.
 
 ## Tests
 
+- Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` before every commit.
+- Integration tests need a `nats-server` binary (see `README.md`, "Development").
+
 - Unit tests must not touch real system state.
   - Fake the clock, the memory and pressure readers, idle time, power and thermal state, and the locks behind traits.
   - Never use real system signals other than on processes the test itself started.
@@ -64,7 +67,7 @@ The product summary is in `README.md`; the specs are in `docs/`.
 - Chaos and end-to-end rubrics live in `docs/`. Chaos tests run only in a sandbox (temporary directories, test-only
   NATS accounts), never against a live installation unless the owner explicitly asks.
 
-## Layout (planned)
+## Layout
 
 ```
 docs/            specs (SPEC.md, protocol, admission, test rubrics)

@@ -7,8 +7,9 @@ that sleeps, maybe a GPU box that is only sometimes on. You, or your AI coding a
 (benchmarks, model evals, video encodes, emulator runs, big builds). corral holds them until a suitable machine is
 online **and has room**, runs them under guard, streams the logs back live, and returns the results.
 
-> **Status: design phase.** The specs are being written and reviewed; no code yet. Watch or star the repo to follow
-> along.
+> **Status: early development.** The specs are approved and milestone **M1** (scheduler, NATS, Linux worker, CLI,
+> git and snapshot input, logs, events, artifacts) is implemented. Nothing is released yet; the guard daemon, the
+> macOS worker, the measurement profiles and interactive leases are later milestones (`docs/SPEC.md` section 13).
 
 ---
 
@@ -74,7 +75,7 @@ is idle" loop. corral turns them into **one system** with one set of rules.
 - **Scheduler, worker, CLI:** Rust. Static binaries, a few MB idle, careful process-group and signal handling.
 - **Artifacts:** streamed over HTTP to the host, with size caps and retention.
 
-## A taste of the CLI (planned)
+## A taste of the CLI
 
 ```sh
 # run a benchmark on the laptop when it's idle and has 8 GB free; fall back nowhere
@@ -111,6 +112,21 @@ corral workers                       # who's online and what they'd admit right 
 3. Merge existing per-host memory guards into corral's guard.
 4. Interactive leases.
 5. External authorization (auth callout, CIBA approvals).
+
+## Development
+
+```sh
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+- Unit tests fake the clock, memory, process table, locks and the scheduler link behind traits; they touch no real
+  system state.
+- Integration tests (`crates/corral-cli/tests/`) start a real `nats-server` in a temporary directory with generated
+  nkeys and the per-identity permissions of `docs/PROTOCOL.md` section 12, plus an in-process scheduler and workers.
+  Install `nats-server` first (`brew install nats-server`, or your distribution's package); set `NATS_SERVER` to use
+  a binary that is not on `PATH`. A few tests use `python3` and skip themselves without it.
+- Crates: `corral-proto` (wire format, state machine, config), `corral-sched`, `corral-worker`, `corral-cli` (the
+  `corral` binary).
 
 ## License
 
