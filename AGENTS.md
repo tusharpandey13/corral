@@ -4,10 +4,11 @@ Rules for AI coding agents (and humans) working in this repo. Read it in full be
 
 ## Status
 
-The specs in `docs/` were **approved by the owner on 22-Nov-2026**. **Milestone M1 is in progress** (scheduler,
-NATS, Linux worker, CLI, git/snapshot input, logs, events, artifacts: SPEC.md section 13). Later milestones (M2 and
-on) stay unimplemented until their turn; the round-2 drafts (exec, classifier, agent jobs, external tokens) are still
-drafts.
+The specs in `docs/` were **approved by the owner on 22-Nov-2026**. **Milestone M1 is in progress**: the scheduler,
+NATS wiring, Linux worker, CLI, git/snapshot input, logs, events and artifacts (SPEC.md section 13) are implemented;
+the end-to-end and chaos rubric (TESTING.md) has not been run and the owner has not accepted the milestone yet. Later
+milestones (M2 and on) stay unimplemented until their turn; the round-2 drafts (exec, classifier, agent jobs,
+external tokens) are still drafts.
 
 - Implement approved specs only, one milestone at a time, with tests that cite requirement IDs.
 - A spec you wrote yourself is not an approved spec. When code and spec disagree, change the spec first.
