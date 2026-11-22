@@ -23,6 +23,10 @@ Unverified external facts are marked **[unverified]**.
 Round 2 (22-Nov-2026, draft): agent work placement (G11): remote exec (§4.14), agent jobs (§4.15), classifier and
 hook mode (§4.16), light/heavy admission classes (R-ADM-08), external DPoP-bound tokens (R-SEC-07). Not approved.
 
+Round 3 (22-Nov-2026, draft): job profiles (§4.17): workers that run only approved profiles, each as its own
+unprivileged runner user; refusal of heavy commands that match no profile; shared caches limited to content-verified
+package stores; approval levels. Not approved.
+
 ---
 
 ## 1. Overview
@@ -250,7 +254,8 @@ behaviour lives in the companion documents named per group.
 - **R-EXEC-04** Non-exclusive jobs run at background priority (macOS `taskpolicy -b`, Linux `nice 10` + `ionice
   idle` + `cpu.weight 50`); exclusive jobs do not. **AC:** process QoS inspected in test.
 - **R-EXEC-05** Jobs receive a clean environment (configured `PATH`, `HOME`, `LANG`, `TMPDIR`, `CORRAL_*`, the job's
-  `env`); submitter secrets are never forwarded. **AC:** env dump test.
+  `env`); submitter secrets are never forwarded. **AC:** env dump test. **Round 3:** on `required` workers the env is the profile's
+  allowlist, the R-JPROF-20 cache variables and `CORRAL_*`.
 - **R-EXEC-06** A job's exit code in `pause_on_exit` pauses the worker with the reason (legacy "exit 4/5 pauses the
   queue" semantics). **AC:** job exits 4 → worker paused; status shows reason.
 
@@ -309,9 +314,10 @@ behaviour lives in the companion documents named per group.
   token's subject maps to an identity slug and the same permission templates as nkey identities; approval grants
   (CIBA) arrive in `authz` as before. nkeys keep working (`auth_users` bypass). **AC:** a valid token with a matching
   DPoP proof is accepted; a replayed proof (same `jti`), a proof signed by another key, a wrong audience and an expired
-  token are each rejected with `forbidden`.
+  token are each rejected with `forbidden`. **Round 3:** action levels and the profile actions per R-JPROF-18.
 - **Known limit (M1 review).** A job runs as the worker's OS user and can read the worker's nkey seed (PROTOCOL.md
-  12.1, "Known limits"); a separate unprivileged job user or a container/VM runtime is future work.
+  12.1, "Known limits"); a separate unprivileged job user or a container/VM runtime is future work. **Round 3:**
+  resolved for workers with `job_profiles = "required"` (R-JPROF-07).
 - **R-SEC-06** NATS and HTTP listen only on configured addresses (default loopback + the private overlay address).
   **AC:** config validation rejects `0.0.0.0` unless `allow_public_bind = true`.
 
@@ -350,15 +356,19 @@ behaviour lives in the companion documents named per group.
 - **R-REXEC-03** **Dirty-tree sync:** before each command the CLI sends the delta of tracked plus
   untracked-not-ignored files against the session's last manifest (deny-list of R-IO-02 applies); a missing base
   commit is fetched by the worker from a configured git remote. **AC:** an edited tracked file and a new untracked
-  file are visible remotely; an ignored `.env` is not sent.
+  file are visible remotely; an ignored `.env` is not sent. **Round 3:** on `required` workers the delta goes to the
+  runner workspace (R-JPROF-08).
 - **R-REXEC-04** **Same-path mode** (`workdir = "mirror"`, allowed roots configured on the worker): the command runs
   at the same absolute path as on the caller. The worker refuses with `dirty_foreign` when that checkout has changes
   not written by an earlier sync of an exec session, naming the files; it never overwrites them. `workdir = "scratch"`
   uses a worker-managed directory instead. **AC:** foreign change present → refusal names it; file unchanged.
+  **Superseded for `required` workers (round 3, R-JPROF-08):** `mirror` is refused there because a runner cannot write
+  the caller's checkout; `dirty_foreign` does not arise in workspaces. `mirror` remains only for `off` workers.
 - **R-REXEC-05** **Outputs back:** stdout/stderr stream live and the CLI exits with the command's code (125 when
   killed or lost); changes the command made to tracked or untracked-not-ignored files return as a patch applied on the
   caller only if it applies cleanly (else saved and reported); ignored paths return only with `--pull PATH`, capped.
   **AC:** lockfile change applied; conflicting local edit → patch kept as a file and reported; `--pull` path present.
+  **Round 3:** on `required` workers, outputs per R-JPROF-09.
 - **R-REXEC-06** An exec is an attempt like any other: guard kills are final, a lost exec never re-runs on its own,
   and every exec appears in `corral status`. **AC:** guard kill during exec → exit 125 with the reason; no re-run.
 
@@ -373,17 +383,20 @@ behaviour lives in the companion documents named per group.
   it exits 0 on success; it writes a JSON result file at `{result}` (`status`, `summary`, optional `branch`). A runner
   whose agent outlives it violates the contract; a site-specific wrapper script (outside corral) adapts tools that
   detach. **AC:** with a fake runner, the worktree exists at the base sha, the runner received the brief, and a runner
-  that exits without writing `{result}` yields `agent_result.status = "no_result"`.
+  that exits without writing `{result}` yields `agent_result.status = "no_result"`. **Round 3:** on `required` workers
+  the agent runner is an agent profile instance (R-JPROF-14).
 - **R-AGENT-02** On completion the worker commits nothing itself, pushes the agent's branch to the exchange remote and
   reports `agent_result`: branch, head sha, summary from the result file (capped 4 KiB), diffstat, runner exit
   status; the result file is kept as an artifact. Transcripts stay on
-  the worker's host. **AC:** result fields present; branch fetchable by the submitter.
+  the worker's host. **AC:** result fields present; branch fetchable by the submitter. **Round 3:** on `required` workers
+  the worker pushes from a bundle the runner hands over (R-JPROF-14).
 - **R-AGENT-03** Agent jobs use a named slot `agent` (default 6 per host) and are admitted as light work plus a
   per-agent memory reservation (`agent_ram`, default 256 MiB); commands the agent runs take heavy slots under normal
-  admission. **AC:** cap + 1 submits → one `queued` with `agent slots full`.
+  admission. **AC:** cap + 1 submits → one `queued` with `agent slots full`. **Round 3:** on `required` workers the cap
+  is the profile's `max_concurrent`.
 - **R-AGENT-04** Waiting is explained like any job; at `deadline`, `fallback = wait` notifies and keeps waiting,
   `fallback = local` runs the agent on the submitter's host. **AC:** fake clock past deadline → one notification, or a
-  local start.
+  local start. **Round 3:** on `required` workers `fallback = local` is refused; the job waits (R-JPROF-13).
 - **R-AGENT-05** Cancel sends TERM to the runner's process group, then KILL after the grace period; the worktree is removed unless
   `--keep`. **AC:** cancel mid-run → runner group terminated; job `cancelled`.
 
@@ -413,17 +426,106 @@ behaviour lives in the companion documents named per group.
   rewrite without overriding the harness's permission decision unless configured to.
   **AC:** for each decision a fixture event produces the expected harness output; observe mode never changes input;
   a chained rewriter's output is the input to placement.
+  **Round 3:** with `placement.job_profiles = "required"`, heavy segments (weight ≥ `wait_threshold`) need a profile;
+  an unmatched heavy command is **denied** and logged `profile_miss`, never queued or run under guard; only light work
+  uses the guarded local run (R-JPROF-13).
 - **R-PLACE-04** Presence for hook decisions is read from a local cache (`corral workers --watch`), so a decision
   makes no network call; p95 decision time < 50 ms. **AC:** benchmark over the golden corpus.
 - **R-PLACE-05** Escape hatch: a configured marker comment (default `# @local`) or `corral local --reason TEXT -- CMD`
   runs locally (guard limits without the timeout) and is logged with the reason. **AC:** marker honoured and logged.
+  **Round 3:** with `placement.job_profiles = "required"`, light segments only; on a heavy segment it is denied.
 - **R-PLACE-06** The rules file is data; corral never edits it. `corral classify --propose` reads the decision log and
   writes a proposal diff (patterns that ran locally under guard, fast and small, proposed as `local_ok`; patterns
-  killed by the guard timeout, proposed one weight higher); applying it is the owner's act.
+  killed by the guard timeout, proposed one weight higher); applying it is the owner's act. **Round 3:** it also
+  emits profile drafts from `profile_miss` (R-JPROF-12).
   **AC:** proposal written; rules file unchanged.
 - **R-PLACE-07** A per-project profile (`light`, `build-heavy`, `media-device`) may be supplied by an external
   provider (a file or command) and selects rule sets; corral does not store profiles. **AC:** profile switches a rule
   set in a fixture.
+
+### 4.17 Job profiles and shared verified caches (draft, round 3)
+
+**Purpose.** A worker may be configured so that it runs **nothing but instances of approved job profiles**. Each
+instance runs as a dedicated, unprivileged OS user, the **runner**, and each profile has its own runner. A job profile
+is distinct from an admission profile (`default`, `measurement`, `gui`, GUARDS.md §7.2) and from a project profile
+(R-PLACE-07).
+
+**Terms:**
+- **Job profile:** a closed-schema document described below.
+- **Instance:** a job, exec step, lease step or agent job that names a profile.
+- **Runner:** the OS user an instance runs as; exactly one per profile.
+- **Launcher:** a corral process that runs as the runner, is started by the OS service manager from configuration only
+  an administrator can write, and spawns instances.
+- **Installer:** a site-provided privileged component that verifies an approval artefact and prepares runners.
+- **Approval artefact:** opaque evidence from the authorization server, verified by the installer.
+- **Light and heavy:** a command segment is **heavy** when its heaviness `weight` (R-PLACE-01) is at or above
+  `wait_threshold` (default 2), and **light** otherwise, including `local_ok` and `local_only` segments. Heavy work is
+  a job; light work is not.
+
+| ID | Requirement | Acceptance criteria |
+|---|---|---|
+| **R-JPROF-01 Mode** | `worker.job_profiles = "required"` makes the worker refuse every job, exec, lease step and agent job that does not name an installed profile. The default stays `"off"` (v1 behaviour). With `required`, the worker never spawns job processes as its own user. | A plain `submit` to a `required` worker is declined with check `job_profile`; a static test shows no spawn path as the worker's own uid. |
+| **R-JPROF-02 Profile schema (closed)** | A profile has exactly these fields: `profile_id`, `rev`, `replaces`, `host`, `instance`, `kind` (`command`, `agent`), `prefix` (argv array, 1-8 tokens), `exe` (absolute path, or `./`-relative inside the workspace), `args` `{allow, deny[], max}`, `run_as`, `isolation` (`user`; other values reserved), `owner_home` (`deny`), `workspace` `{mode: per_repo\|per_job, max_gb, idle_days}`, `env` `{allow[], path[]}`, `network` (`none`, `loopback`, `{allow[]}`, `any`), `devices`, `gui`, `secrets` (`none`; names reserved, R-JPROF-16), `cache` (`none` or R-JPROF-19), `sync_in` `{deny[], max_mb}`, `sync_out` `{patch, pull[], max_mb}`, `limits` `{max_lease_s, mem_mb, cpu: background\|normal, procs, files}`, `max_concurrent`, `admission` (`light`, `heavy`), `valid_until`, `purpose`. Every list and string is capped; the whole profile is ≤ 4 KiB. Unknown fields, missing fields and out-of-range values are refused. No value is defaulted from worker config. Each field has a defined one-line human rendering (`corral profiles show --render`), shown in schema order with `purpose` last and marked as the requester's claim. `run_as` is the configured runner prefix plus `profile_id` (example: `_jobrun_npm_test`). | Schema corpus test: each missing or unknown field is refused; a rendering golden file; a size cap test; a `run_as` that is not derived from `profile_id` is refused. |
+| **R-JPROF-03 Matching (no shell)** | An instance carries `argv` (UTF-8, no NUL, each token ≤ 4 KiB, total ≤ 64 KiB). It matches when: (1) `argv[0..k]` equals `prefix[0..k]` byte for byte, with no normalization, case folding or abbreviation; (2) the remaining tokens number ≤ `args.max`, and none matches a deny glob (a token `--opt=value` is also tested as `--opt`); each matches `args.allow`; (3) the env names match `env.allow` and none is in the built-in deny set (`PATH`, `HOME`, `TMPDIR`, `DYLD_*`, `LD_*`, `NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, `PYTHONSTARTUP`, `PYTHONPATH`, `BASH_ENV`, `ENV`, `PERL5OPT`, `RUBYOPT`, `GIT_SSH*`, `GIT_EXEC_PATH`, `GIT_CONFIG*`, plus the cache variables of R-JPROF-20 when the profile has a `cache`); (4) `cwd` is a relative path whose resolved real path is inside the workspace. The launcher executes `exe`, never `argv[0]` and never a PATH lookup, with `argv` passed as an array. No shell is invoked, so shell metacharacters are literal bytes. Profile validation refuses a `prefix[0]` that is a shell, `env`, `xargs`, `sudo`, `su`, `doas`, `nohup`, `time`, `nice`, `timeout`, `exec` or an OS script host, and refuses an interpreter prefix without a fixed module or script argument. | U-JP-01 corpus: exact matches, near misses (case, homoglyph, abbreviation, trailing `;`), deny globs, env deny, cwd escape through `..` and through a symlink. SEC-JP-01..09. |
+| **R-JPROF-04 Prefix is not the boundary** | A profile names intent and blocks argv-level tricks, but programs such as test runners and build tools execute repository code. Containment comes from the runner (R-JPROF-07) together with `network`, `limits` and the workspace. Documentation and the rendering must not imply otherwise. | Doc review; SEC-JP-10 (a repository script tries other users' files and the network: both fail). |
+| **R-JPROF-05 Approval binding** | A profile's identity is `digest = SHA-256(canonical bytes)`. The canonical encoding is the authorization server's approval-detail encoding when one is configured, otherwise RFC 8785 JCS. Approval is the gated action `approve` on `corral://<instance>/profiles/<id>`, carrying the full profile in its `authorization_details`, at approval level 3 (R-JPROF-18). Any change creates `rev + 1` with `replaces = <old digest>` and needs a new approval; until then the old rev stays in force. Instances name `{profile_id, rev, digest}`, and the worker and the launcher both compare them to the installed digest. | Changing one byte gives a new digest; the instance with the old digest is refused after the new rev installs; rollback is refused. |
+| **R-JPROF-06 Installer contract** | The scheduler never installs. After approval it fetches the opaque approval artefact (R-SEC-07 verifier extension) and forwards `{detail, artefact, op}` to the target worker, which writes it to the installer inbox. The installer (privileged, site-provided, configured as `worker.installer = {inbox, outbox}`) must: verify the artefact offline against pinned approver keys; check single use, expiry, host and instance, monotonic rev, a safe `run_as` derived from `profile_id`, an `exe` outside homes and not writable by the runner, and that **every value is enforceable on this host** (otherwise it refuses the whole profile); then create or update the runner and its service-manager entry, workspace root, network rule, cache membership (R-JPROF-19) and an admin-owned copy of the detail; and report `{status, profile_id, rev, digest, run_as, reason}` in the outbox. The launcher binary path, the dispatch group, the cache root and size limits come from the installer's own admin-owned configuration, **never from the detail**. A failure part way **rolls back every step** of that request. `op = remove` needs no artefact. | IT with a fake installer: install, refuse with each reason, remove, a forced mid-way failure leaves nothing behind; presence lists `id@rev:digest`. |
+| **R-JPROF-07 Runner isolation** | Each runner serves one profile, has its own primary group and is not in the group of any user home. It has no login shell and no password, and cannot read or traverse other users' homes, including the worker's (so the worker's credentials are unreadable to jobs). Each runner's home and workspaces are mode 0700. The only group a runner may share with another runner is a cache group (R-JPROF-19). The launcher applies `limits` (rlimits, background QoS, memory watchdog or cgroup, process cap), fixes `HOME`, `TMPDIR` and `PATH`, and runs one process group per instance (R-EXEC-01). This closes the PROTOCOL.md §12.1 known limit for `required` workers on every OS. | SEC-JP-11..14: the runner reads the worker seed (EACCES), signals a worker-owned process (EPERM), writes another runner's workspace (EACCES), reads another runner's home (EACCES). |
+| **R-JPROF-08 Workspace and files in** | The workspace is `per_repo` (keyed by caller repository root and profile; persistent; ignored files kept as the profile's own caches; GC after `idle_days` or above `max_gb`) or `per_job`. Before each step the worker streams the caller's delta (R-REXEC-03 scope, minus `sync_in.deny`, ≤ `sync_in.max_mb`) to the launcher over its local socket. A missing base commit is fetched by the worker into its own cache and passed as a `git bundle`, so **runners never hold remote credentials**. The launcher brings the workspace to exactly base plus delta for non-ignored files. | IT: a dirty file and a deletion are reflected; an ignored cache survives; a file outside the delta written by an earlier instance is reset; a `.env` is never sent. |
+| **R-JPROF-09 Files out and paths** | After a step the launcher returns the patch of changed non-ignored files (if `sync_out.patch`) and the requested `--pull` paths that match `sync_out.pull`, are regular files inside the workspace (no symlinks out) and total ≤ `sync_out.max_mb`. The CLI rewrites argv tokens that start with the caller's repository root to the workspace root. With `translate_paths = true` it shows the workspace root as the caller root in displayed output only. | IT: `--pull` outside the pattern is refused; a symlink to `/etc/passwd` is refused; translated display and raw log are both checked. |
+| **R-JPROF-10 Lease per job** | Every instance carries `lease_s ≤ limits.max_lease_s`, supplied by the submitter or the hook (default `max_lease_s`). It is enforced as the attempt timeout (R-EXEC-02) and recorded in the job record and events. | A lease above the cap gets `bad_request` naming the cap; `sleep` past the lease ends `killed:timeout`. |
+| **R-JPROF-11 Revocation** | Removing permission is never gated. `corral profiles disable <id>`, an authorization-server revocation that the scheduler learns from the grant-status check, and `valid_until` passing all stop new instances at once. Revocation or disable also **cancels running instances** (TERM, then KILL after `kill_grace`) with reason `profile_revoked`. This is a deliberate stop, so G4 holds. Expiry by `valid_until` lets running instances finish within their lease. A worker that receives `remove` refuses further instances even if the scheduler keeps dispatching. | IT: disable mid-step gives `cancelled:profile_revoked`; expiry mid-step finishes; dispatch after remove is declined. |
+| **R-JPROF-12 Proposal tool** | `corral profiles propose [--from decision-log] [--adapter CMD]... [--min-sessions 3] [--out FILE]` reads the hook decision log (`profile_miss` entries) and any external history adapters. Adapters are commands that emit JSONL `{shape, repo_key, host, duration_s, exit}` and must never emit raw command strings. It writes draft profiles (TOML, mode 0600) with counts and duration statistics as comments. Shapes come only from the R-PLACE-01 segment parser and are built **constructively**: at most 3 tokens matching `^[a-z][a-zA-Z0-9:_.-]{0,30}$`, stopping at the first other token. Tokens that match secret patterns or have high entropy are dropped. `repo_key` is a name, never a path. Below `--min-sessions` nothing is proposed. It never requests approval; `corral profiles request FILE [--only IDS]` is a separate act. | U-JP-05: canaries in argv, env, URLs, heredocs and high-entropy names never appear in the output; a shape below the threshold is absent; the file mode is 0600. |
+| **R-JPROF-13 Placement: heavy needs a profile, unmatched heavy is refused** | With `placement.job_profiles = "required"`, the hook (R-PLACE-03) treats a command with any heavy segment as a job. Each heavy segment must match an installed profile on the target (from the local presence cache; still no network call); it is rewritten to `corral exec --on W --profile ID --cwd DIR --lease S -- ARGV`, and pipes and redirections stay in the caller's shell. If any heavy segment matches no profile, the **whole command is denied** with a one-line reason naming the shape and how to request a profile, and a `profile_miss` entry (shape only) is logged. Nothing runs locally under guard as a fallback, whether the target is online or offline. W offline: a matching heavy segment is queued (exit 75, as R-PLACE-03); an unmatched one is denied. Light segments are not jobs: `local_ok` and `local_only` run locally as before; an `unknown` light segment runs locally in the **light envelope** (`corral local --light`: timeout, low CPU/IO weight, memory cap) or, if it matches a profile and W is online, as an instance. Matching in the hook is advisory; the worker and launcher enforce. The hook is placement policy for a same-user caller, not a security boundary. | Fixture events: a matching heavy segment is rewritten; an unmatched heavy one is denied and logged, online and offline; a light unknown runs in the light envelope; `bash -lc "X"` is unwrapped; the escape hatch on a heavy segment is denied. |
+| **R-JPROF-14 Agent profiles** | An `agent`-kind profile is the agent runner (R-AGENT-01) run as its runner in a `per_job` workspace. The agent's own commands run inside the runner and are not matched again: the agent profile's runner, network and limits are its whole capability. Harness credentials live in that runner's home, set up once by an administrator. The branch returns as a bundle that the worker pushes (the runner holds no remote credentials). `max_concurrent` replaces the worker's `agent` slot cap for that profile. | IT with a fake agent runner: runs as the runner uid; the bundle is pushed by the worker; cap + 1 queues. |
+| **R-JPROF-15 Scheduler least privilege** | The scheduler only issues and tracks jobs. It needs **no secrets except its own** NATS credentials or nkey, the auth-callout signing key and the HTTP capability-token key. It never execs processes. It holds no installer, runner or approver key. Deployments should run it as its own user with no capabilities, a read-only system, no exec beyond its binary, no access to job input or artifact stores of workers or to git remotes, and network access only to its own listeners and the bus. | Static test: the scheduler crate has no process-spawn call; `corral config check` warns when the scheduler state dir or credentials are group- or world-readable. |
+| **R-JPROF-16 No data through corral** | corral never carries secret values, sealed or not. A profile's `secrets` is `none` in this draft. A later secret release, if adopted, is delivered by the authorization side **directly to the runner on its own channel**; corral may only request the release, record a `delivered` event `{secret, job, profile, at}` and refuse to start the instance before it. | Schema test: `secrets` other than `none` is refused; INV-7 holds for profile instances. |
+| **R-JPROF-17 Guard separation** | The host guard runs as its own user and service, separate from the scheduler and the worker. It holds no bus credentials and no network access, and only its local socket. It has process visibility, and signal rights only in enforce mode. | Deployment test: the guard user cannot read the scheduler's state or credentials; in observe mode it has no signal capability. |
+| **R-JPROF-18 Approval levels** | With external authorization configured (R-SEC-07), each gated action has a level: **0** identity only (no grant), **1** standing grant approved once, **2** per-request approval, **3** per-request approval on the approver's strongest channel only, **4** hardware key (reserved). Defaults: profile `approve` 3; the unsafe admin actions (kill switch off, `guard stop`, resume after a guard stop, `kill_stale`) 3; `lock_none`, `cancel_other`, `resubmit_killed`, owner mutating verbs and cost tiers 2; everything else 0, including instances of approved profiles, `profile_request`, `profile_disable` and the safe admin direction (kill switch on, pause, drain). Removing permission is never above 0. Levels are config (`auth.levels`), validated: unsafe admin and `approve` cannot be set below 2. | Config test: each default; lowering `approve` to 1 is refused; a level-0 action needs no grant; a level-3 action approved through a non-strong channel is refused (fake authorization server). |
+| **R-JPROF-19 Shared verified caches** | A profile may join a **cache group** with `cache: {group, stores, with, hydrate}`: `group` names a family; `stores` is a non-empty subset of `npm`, `cargo`, `pip`; `with` lists the profiles already in the group (shown on approval, so the approver sees who shares); `hydrate` is `none` or `npm_ci_offline`. A store may be shared only when it is **content-addressed**, **checked by the consumer at use against a hash from a source that is not shared** (its own lockfile, its own index or the registry), and **no name-to-hash mapping is shared**. So the shared part is: npm's content store only (indexes stay per profile); cargo `.crate` files only, as a pool keyed by SHA-256; pip's HTTP cache only with hash checking forced. Build outputs, `node_modules`, Gradle and Maven caches, the uv cache, unpacked sources, registry indexes, toolchains and tool config are never shared, and the schema has no value for them. The installer creates the group (example `_jobcache_node`) and `<cache_root>/<group>` (root-owned, group-writable, setgid) and adds the runner; it refuses when `with` differs from the installed members, when `stores` differs from the group's, or when the group already exists and was not created by it. | IT with a fake installer: create, join, refuse each mismatch, rollback on failure; schema refuses `stores: [gradle]`. SEC-JP-15..20. |
+| **R-JPROF-20 Pointing tools at the shared store** | The launcher sets the tool environment from the installed profile, never from the caller, and adds these names to the built-in env deny list: **npm**: per-profile `npm_config_cache` whose `content-v2` is the shared content store, user and global npm config pinned to an empty admin-owned file, umask `007`; a workspace `.npmrc` is refused (`cache_config_override`). **cargo**: per-profile `CARGO_HOME`; the launcher **imports** each crate named in the workspace `Cargo.lock` from the pool by copying it privately and checking its SHA-256 against the lockfile checksum before cargo can see it, and **publishes** after the step only crates whose SHA-256 equals a lockfile checksum; with `network: none`, `CARGO_NET_OFFLINE=true`. **pip**: shared `PIP_CACHE_DIR`, `PIP_REQUIRE_HASHES=1`, `PIP_ONLY_BINARY=:all:`, `PIP_CONFIG_FILE=/dev/null`. With `hydrate: npm_ci_offline`, before a step whose lockfile changed (or with no `node_modules`) the launcher runs `npm ci --offline` as the runner; on a miss or an integrity error the step ends `deps_missing` (exit 75, with a hint) and `node_modules` is removed, so no step runs on partial dependencies. | IT: two profiles share downloads but not indexes; caller overrides refused; offline hydrate from the shared store works; a miss gives `deps_missing`. SEC-JP-15..20. |
+| **R-JPROF-21 Cache limits, GC and poisoning reports** | Per store size limits come from installer config. A GC user that is a member of every cache group and of nothing else runs daily and hourly while a store is over its limit: it re-hashes content-addressed entries and deletes mismatches, removes temporary files older than 24 h, and evicts the oldest entries to 80% of the limit, skipping entries modified in the last 10 min. The launcher stops publishing above the limit and refuses publish and hydrate while the volume is below a free-space floor (default 15%). A mismatch found by GC or by an import emits `cache_corrupt` or `cache_reject` naming the store, the entry and the profile whose runner owns the file. Inside a family the residual risk is **denial of service** (a member can corrupt or delete shared entries), not code execution, as long as the consumer checks hold. | IT: over-limit store shrinks to ≤ 80%; a corrupt entry is removed and reported with the right profile; recent entries survive GC. |
+
+**Amendments to existing text** (each also noted in place):
+
+| Item | Change |
+|---|---|
+| **R-REXEC-03** | With `job_profiles = "required"`, the delta goes to the runner workspace (R-JPROF-08). |
+| **R-REXEC-04** (same-path `mirror` mode) | **Superseded for `required` workers.** `mirror` is refused there, because a runner cannot write the caller's checkout; `dirty_foreign` does not arise in workspaces. `mirror` remains only for `off` workers. |
+| **R-REXEC-05** | Outputs per R-JPROF-09. |
+| **R-AGENT-01, R-AGENT-02** | On `required` workers the agent runner is an agent profile instance; the push is done by the worker from a bundle (R-JPROF-14). |
+| **R-AGENT-03** | On `required` workers the slot cap is the profile's `max_concurrent`. |
+| **R-AGENT-04** | On `required` workers, `fallback = local` is refused: the job waits (a local agent could not run its heavy commands, R-JPROF-13). |
+| **R-PLACE-03** | With `placement.job_profiles = "required"`: the rewrite target is a profile instance, an unmatched heavy command is denied instead of queued or run under guard, and only light work uses the guarded local run (R-JPROF-13). |
+| **R-PLACE-05** | With `placement.job_profiles = "required"`, the escape hatch applies to light segments only. |
+| **R-PLACE-06** | `--propose` also emits profile drafts from `profile_miss` (R-JPROF-12). |
+| **R-EXEC-05** | On `required` workers the job env is the profile's allowlist, the R-JPROF-20 cache variables and `CORRAL_*`. |
+| **R-SEC-04, R-SEC-07** | Gated actions gain `profile_request`, `approve` (on `profiles`) and `profile_disable`, with levels per R-JPROF-18. `exec`, `agent_submit` and `lease_open` are not gated separately on `required` workers: the profile approval is the grant. An identity-only token may open a session that carries only level-0 actions. |
+| **§4.10 known limit, PROTOCOL.md §12.1 "A job runs as the worker's OS user"** | Resolved for `required` workers (R-JPROF-07). |
+
+**Configuration (§9):**
+
+```toml
+[worker]
+job_profiles = "required"                 # off | required
+installer = { inbox = "/var/corral/installer/inbox", outbox = "/var/corral/installer/outbox" }
+launcher_socket_dir = "/var/run/corral"    # one socket per runner, group = the worker's dispatch group
+translate_paths = true
+
+[placement]
+job_profiles = "required"                 # off | required: heavy segments need a profile (R-JPROF-13)
+
+[auth.levels]                              # R-JPROF-18; defaults shown
+approve = 3
+admin_unsafe = 3
+lock_none = 2
+cancel_other = 2
+resubmit_killed = 2
+owner_mutating = 2
+```
+
+The installer's own config (admin-owned, outside corral) holds the launcher path, the dispatch group, the runner
+prefix, the cache root and the per-store limits (defaults: npm 10 GB, cargo 10 GB, pip 5 GB).
 
 ## 5. Architecture
 
@@ -626,6 +728,7 @@ light_ram_default = "512M"            # RAM a light job without ram_mb is admitt
 work_dir = "$HOME/Library/Application Support/corral"
 runtime = "native"
 keepawake_required_for = ["heavy"]
+job_profiles = "off"                   # off | required: run only approved job profiles (round 3, §4.17)
 
 [guard]
 mode = "enforce"                       # enforce | observe
@@ -653,6 +756,7 @@ target = "laptop"
 rules = "$XDG_CONFIG_HOME/corral/placement.toml"
 local_guard = { timeout = "30s", cpu_weight = 20, io_weight = 20, memory_max = "1G" }
 escape_marker = "# @local"
+job_profiles = "off"                   # off | required: heavy segments need a profile (round 3, R-JPROF-13)
 
 [auth.external]                        # optional, phase 2 plug-in point (R-SEC-07)
 issuer = "https://issuer.example.ts.net"
@@ -852,9 +956,10 @@ working tree; keep-awake holds; a queue that tolerates workers offline for days.
   generic named-resource slot (`slots = { heavy = 1, light = 2, io = 1 }`)? Proposed: generic named slots.
 - **Q15. (decided: `mirror` where roots are configured, else `scratch`) Exec workdir default** (R-REXEC-04): same-path `mirror` (commands with absolute paths work; refuses on
   foreign changes) vs `scratch` (never touches the worker user's checkout). Proposed: `mirror` where roots are
-  configured, else `scratch`.
+  configured, else `scratch`. Round 3: `required` workers always use runner workspaces (R-JPROF-08).
 - **Q16. (decided: heaviness levels with a wait threshold, R-PLACE-01/03)** Hook decision when the target is
-  offline: weight ≥ `wait_threshold` waits for W, below runs locally under guard.
+  offline: weight ≥ `wait_threshold` waits for W, below runs locally under guard. Round 3: with `placement.job_profiles = "required"`,
+  `wait_threshold` is also the light/heavy line, and an unmatched heavy command is denied (R-JPROF-13).
 - **Q17. (resolved by test on one harness version: rewrites need no allow decision and stay subject to permission
   rules, matched on the rewritten command; parallel hooks that both rewrite race and one is dropped; so hook mode must
   be the single rewriting entry point and chain other rewriters itself, R-PLACE-03) Harness rewrite semantics**: whether a pre-tool hook's input rewrite must be paired with an
@@ -866,6 +971,10 @@ working tree; keep-awake holds; a queue that tolerates workers offline for days.
   9449 in phase 2 first, NATS profile after review.
 - **Q20. (decided: the classifier decides; weight ≥ `heavy_threshold`, default 3, gets heavy admission) Exec class default:** classify from the classifier's segment classes (`heavy` → heavy) (proposed) or always
   light unless `--class heavy`.
+- **Q21. (round 3) Alternative prefixes per profile.** One runner per profile also splits build outputs per profile
+  (`cargo test`, `cargo build` and `cargo clippy` as three profiles build three `target/` dirs). Proposed: allow
+  `prefixes` (1-4 argv prefixes sharing one `exe` and every other field); they run the same repository code under the
+  same limits, so splitting them buys no isolation.
 
 ## 17. Implementation notes (M1)
 
