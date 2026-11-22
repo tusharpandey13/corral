@@ -620,6 +620,23 @@ pub mod tests {
         assert_eq!((kinds(&all, "would_resume"), kinds(&all, "would_kill")), (1, 0), "{all:?}");
     }
 
+    /// Note 43: a paused unit that gains a `never` member is not killed at pause_max (never wins), and the engine lets
+    /// go of it so the executor's reconcile continues it.
+    #[test]
+    fn a_paused_unit_that_gains_a_never_member_is_not_escalated() {
+        let mut e = engine();
+        let units = vec![pausable("g10")];
+        for i in 0..3 {
+            e.tick(Tick { now_ms: i * 2000, sample: &free(21.0), units: Some(&units), stop: None });
+        }
+        assert_eq!(e.paused_keys(), vec!["g10".to_string()]);
+        let mut u = pausable("g10");
+        u.has_never = true;
+        let d = e.tick(Tick { now_ms: 70_000, sample: &free(21.0), units: Some(&[u]), stop: None });
+        assert_eq!(kinds(&d, "would_kill"), 0, "{d:?}");
+        assert!(e.paused_keys().is_empty(), "released to the executor's reconcile");
+    }
+
     /// Note 42: a unit that survives a real kill is tried again after retry_ms, not before; in observe mode it is not.
     #[test]
     fn enforce_retries_a_unit_that_survived_its_kill_after_retry_ms() {

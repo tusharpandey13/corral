@@ -347,7 +347,7 @@ mod tests {
         let r = running();
         let member = Proc { pid: 40_001, ppid: 1, pgid: 40_000, rss_kb: 1, start: "a".into() };
         let other = Proc { pid: 50_000, ppid: 1, pgid: 50_000, rss_kb: 1, start: "b".into() };
-        assert_eq!(sweep_targets(&Table(Some(vec![member])), &r).0, true);
+        assert!(sweep_targets(&Table(Some(vec![member])), &r).0);
         assert_eq!(sweep_targets(&Table(Some(vec![other])), &r), (false, vec![]), "group id possibly reused: left alone");
         assert_eq!(sweep_targets(&Table(None), &r), (false, vec![]));
         // a recorded escapee is swept by pid only while its start time matches
