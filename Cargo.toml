@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/corral-proto", "crates/corral-sched", "crates/corral-worker", "crates/corral-cli"]
+members = ["crates/corral-proto", "crates/corral-sched", "crates/corral-worker", "crates/corral-guard", "crates/corral-cli"]
 
 [workspace.package]
 version = "0.1.0"

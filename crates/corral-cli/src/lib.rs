@@ -5,6 +5,8 @@ pub mod client;
 pub mod daemon;
 pub mod exitcode;
 pub mod follow;
+pub mod guardcmd;
+pub mod lockcmd;
 pub mod render;
 pub mod snapshot;
 pub mod submit;

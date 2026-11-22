@@ -12,13 +12,15 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 corral-proto = { path = "../corral-proto" }
 corral-sched = { path = "../corral-sched" }
 corral-worker = { path = "../corral-worker" }
+corral-guard = { path = "../corral-guard" }
+rustix = { version = "1.1.6", features = ["process"] }
 async-nats = "0.46.0"
 futures = "0.3.34"
 nkeys = "0.4.5"
 serde_json = "1.0.154"
 sha2 = "0.11.0"
 tar = { version = "0.4.46", default-features = false }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "net", "signal"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "net", "signal", "process"] }
 tracing = "0.1.44"
 zstd = "0.14.4"
 

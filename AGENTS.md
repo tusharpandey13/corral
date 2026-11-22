@@ -4,10 +4,11 @@ Rules for AI coding agents (and humans) working in this repo. Read it in full be
 
 ## Status
 
-The specs in `docs/` were **approved by the owner on 22-Nov-2026**. **Milestone M1 is in progress**: the scheduler,
-NATS wiring, Linux worker, CLI, git/snapshot input, logs, events and artifacts (SPEC.md section 13) are implemented;
-the end-to-end and chaos rubric (TESTING.md) has not been run and the owner has not accepted the milestone yet. Later
-milestones (M2 and on) stay unimplemented until their turn; the round-2 drafts (exec, classifier, agent jobs,
+The specs in `docs/` were **approved by the owner on 22-Nov-2026**. **Milestone M1 is implemented** (the scheduler,
+NATS wiring, Linux worker, CLI, git/snapshot input, logs, events and artifacts, SPEC.md section 13) and **M2 is in
+review**: `corral guard` in observe mode, `admit`, `run`, `lock` and the decision comparison (SPEC.md 17.2). The
+end-to-end and chaos rubric (TESTING.md) has not been run. Later milestones (M3 and on) stay unimplemented until their
+turn; the round-2 drafts (exec, classifier, agent jobs,
 external tokens) are still drafts.
 
 - Implement approved specs only, one milestone at a time, with tests that cite requirement IDs.
@@ -75,6 +76,8 @@ docs/            specs (SPEC.md, protocol, admission, test rubrics)
 crates/
   corral-proto   message schema, subjects, versioning
   corral-sched   scheduler: job state (SQLite), placement, leases, artifacts HTTP
-  corral-worker  admission, guards, runner, keep-awake holds
+  corral-worker  admission, runner, host lock file, process table
+  corral-guard   the per-host guard: probes, levels, matchers, admission, kill switch, decision log (observe only: it
+                 has no signalling code, and tests/no_signals.rs keeps it so)
   corral-cli     `corral` command
 ```

@@ -31,6 +31,7 @@ pub struct Config {
     pub client: Option<ClientCfg>,
     pub scheduler: Option<SchedulerCfg>,
     pub worker: Option<WorkerCfg>,
+    pub guard: Option<crate::guardcfg::GuardCfg>,
     pub phase2: Option<Phase2Cfg>,
 }
 
