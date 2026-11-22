@@ -38,9 +38,9 @@ pub fn for_identity(id: &Identity) -> Perms {
         Identity::Agent(_) | Identity::Owner => {
             // No JetStream API at all: a consumer an agent could create (a push consumer delivering a job's output to
             // `corral.ctl.<w>`, or an edit of the scheduler's `sink` consumer) is a way to forge control messages
-            // and to stop log archiving. Followers ask the scheduler (`follow`), which creates consumers that
+            // and to stop log archiving. Clients also may not subscribe to `corral.event.>` (every job's events): followers ask the scheduler (`follow`), which creates consumers that
             // deliver into the caller's own inbox space.
-            Perms { publish: vec![format!("corral.api.{slug}.>")], subscribe: vec![inbox, "corral.event.>".into()], allow_responses: false }
+            Perms { publish: vec![format!("corral.api.{slug}.>")], subscribe: vec![inbox], allow_responses: false }
         }
     }
 }

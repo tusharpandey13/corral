@@ -40,7 +40,7 @@ async fn scheduler_does_not_answer_into_foreign_reply_subjects() {
     };
     let created = sink_created().await;
     let agent = nats.bus("agent:laptop").await;
-    // Observable form of the same hole: agents may subscribe to `corral.event.>`, so a reply sent there is seen.
+    // Observable form: a reply sent to an event subject would be seen by anyone listening there.
     let mut leak = agent.client.subscribe("corral.event.leak.>").await.unwrap();
     let probe = encode_request(&Identity::Agent("laptop".into()), "rq-leak", &serde_json::json!({"id": r.id}));
     agent.client.publish_with_reply("corral.api.agent-laptop.get", "corral.event.leak.1", probe.into()).await.unwrap();
@@ -135,10 +135,9 @@ async fn followers_never_see_a_lease_token() {
     let nats = Nats::start(&[]);
     let sched = start_scheduler(&nats, &tmpdir("sched"), |_| {}).await;
     let _w = start_worker(&nats, "w1", &sched.http, &tmpdir("w1"), |_| {}).await;
-    let owner = client(&nats, "owner", &sched.http).await;
-    let r = owner.submit(&spec(&["bash", "-c", "echo hi; sleep 1"]), None).await.unwrap();
-    until("running", 10, || async { owner.get(&r.id).await.unwrap().state != JobState::Queued }).await;
     let agent = client(&nats, "agent:laptop", &sched.http).await;
+    let r = agent.submit(&spec(&["bash", "-c", "echo hi; sleep 1"]), None).await.unwrap();
+    until("running", 10, || async { agent.get(&r.id).await.unwrap().state != JobState::Queued }).await;
     let mut sub = agent.bus.client.subscribe("_INBOX_agent-laptop.review.1.log").await.unwrap();
     let _: serde_json::Value = agent
         .bus
@@ -222,4 +221,41 @@ async fn scheduler_receives_progress_for_status() {
     let c = client(&nats, "owner", &sched.http).await;
     let r = c.submit(&spec(&["bash", "-c", "echo '##corral progress=42 building'; sleep 3"]), None).await.unwrap();
     until("progress in the job view", 10, || async { c.get(&r.id).await.unwrap().progress == Some(42) }).await;
+}
+
+/// R-SEC-02 (follow authorization): only the job's submitter or the owner may follow it. Another agent gets
+/// `forbidden` and no consumer is created for it.
+#[tokio::test]
+async fn follow_is_limited_to_submitter_and_owner() {
+    let nats = Nats::start(&[]);
+    let sched = start_scheduler(&nats, &tmpdir("sched"), |_| {}).await;
+    let _w = start_worker(&nats, "w1", &sched.http, &tmpdir("w1"), |_| {}).await;
+    let mine = client(&nats, "agent:laptop", &sched.http).await;
+    let other = client(&nats, "agent:other", &sched.http).await;
+    let owner = client(&nats, "owner", &sched.http).await;
+    let r = mine.submit(&spec(&["bash", "-c", "echo private-output"]), None).await.unwrap();
+    let mut sink = MemSink::default();
+    follow(&mine, &r.id, FollowOpts { follow: true, sys: false }, &mut sink).await.unwrap();
+    let mut sink = MemSink::default();
+    follow(&owner, &r.id, FollowOpts { follow: true, sys: false }, &mut sink).await.unwrap();
+
+    let deliver = "_INBOX_agent-other.steal.1".to_string();
+    let mut spy = other.bus.client.subscribe(format!("{deliver}.>")).await.unwrap();
+    let e = other.bus.call::<_, serde_json::Value>(&other.subject("follow"), &FollowReq { id: r.id.clone(), deliver }).await.unwrap_err();
+    assert_eq!(e.error, ErrorCode::Forbidden);
+    assert!(tokio::time::timeout(Duration::from_millis(500), spy.next()).await.is_err(), "a foreign follower received data");
+}
+
+/// R-SEC-02: clients hold no direct subscription on job events; they get them through `follow`.
+#[tokio::test]
+async fn clients_cannot_subscribe_to_event_subjects() {
+    let nats = Nats::start(&[]);
+    let sched = start_scheduler(&nats, &tmpdir("sched"), |_| {}).await;
+    let _w = start_worker(&nats, "w1", &sched.http, &tmpdir("w1"), |_| {}).await;
+    let owner = client(&nats, "owner", &sched.http).await;
+    let spy = nats.bus("agent:other").await;
+    let mut ev = spy.client.subscribe("corral.event.>").await.unwrap();
+    let r = owner.submit(&spec(&["bash", "-c", "echo hi"]), None).await.unwrap();
+    follow(&owner, &r.id, FollowOpts { follow: true, sys: false }, &mut MemSink::default()).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(500), ev.next()).await.is_err(), "an agent heard job events directly");
 }

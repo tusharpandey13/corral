@@ -259,7 +259,11 @@ impl Service {
                 {
                     return Err(ApiError::bad(format!("deliver must be a plain subject under {prefix}")).with("field", json!("deliver")));
                 }
-                self.db().get(&r.id).map_err(ApiError::from)?.ok_or_else(|| ApiError::not_found(format!("no job {}", r.id)))?;
+                let j = self.db().get(&r.id).map_err(ApiError::from)?.ok_or_else(|| ApiError::not_found(format!("no job {}", r.id)))?;
+                // R-SEC-02: logs and events are readable by the submitter and the owner only (no per-job read grants).
+                if !from.is_owner() && j.submitter != from.to_string() {
+                    return Err(ApiError::forbidden("only the submitter or the owner may follow a job"));
+                }
                 self.send(Out::Follow { job: r.id, deliver: r.deliver });
                 encode_reply(&json!({ "ok": true }))
             }

@@ -295,7 +295,7 @@ behaviour lives in the companion documents named per group.
 - **R-SEC-02** Each identity may publish and subscribe only on its own subjects. Clients hold no JetStream API
   permission; the scheduler replies only into the caller's own inbox prefix. **AC:** a test tries every forbidden
   publish/subscribe per identity (including consumer create/delete and purge); all fail; an agent's job output cannot
-  steer a worker, and a hostile reply subject gets no answer.
+  steer a worker, and a hostile reply subject gets no answer. Job logs and events reach a client only through `follow`, which the scheduler grants to the job's submitter and the owner (no per-job read grants exist yet); clients have no `corral.event.>` subscription. **AC:** another agent's `follow` → `forbidden`; an agent hears no `corral.event.*` directly.
 - **R-SEC-03** The scheduler authorizes by the identity pinned in the subject; a payload `from` that disagrees is
   rejected. **AC:** mismatched `from` → `forbidden`.
 - **R-SEC-04** Every request schema has an optional `authz` field from v1; enabling approvals for an action changes
