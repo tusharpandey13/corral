@@ -1,7 +1,7 @@
 # corral: design spec
 
-Status: **draft for owner review (v0.1, 22-Nov-2026). Nothing is built.** Per `AGENTS.md`, no implementation starts
-until the owner approves this spec and its companions:
+Status: **approved by the owner on 22-Nov-2026 (v0.1); milestone M1 implemented, later milestones not started.** The
+round-2 sections marked draft (exec, agent jobs, classifier, external tokens) are not part of the approval. Companions:
 
 | Document | Scope |
 |---|---|
@@ -861,3 +861,57 @@ working tree; keep-awake holds; a queue that tolerates workers offline for days.
   9449 in phase 2 first, NATS profile after review.
 - **Q20. (decided: the classifier decides; weight ≥ `heavy_threshold`, default 3, gets heavy admission) Exec class default:** classify from the classifier's segment classes (`heavy` → heavy) (proposed) or always
   light unless `--class heavy`.
+
+## 17. Implementation notes (M1)
+
+Where the approved text was ambiguous or silent, M1 picked these defaults. Each is a candidate for a spec edit if the
+owner prefers otherwise.
+
+1. **Timeout backstop on an orphaned attempt.** R-EXEC-02 says the scheduler ends a silent job `killed:timeout` past
+   `timeout + orphan_grace`, but the PROTOCOL.md section 5 table only has `claimed, running -> killed`. A silent
+   worker's job is `orphaned`, so the table gained `orphaned -> killed` for that one trigger.
+2. **Input failure at the worker declines, it does not fail.** A worker that cannot fetch a git input or download a
+   snapshot sends `declined` with check `input` and the reason (not an attempt, visible in `corral status`), because
+   the cause (network, a mirror not yet fetched) is usually transient. `failed` with reason `input` is used only for
+   an upload that never completes (1 h) or fails verification.
+3. **`claim_deadline` is refreshed by heartbeats.** A claimed job whose worker is alive and still fetching its input
+   is not declined by the claim deadline: a heartbeat for a `claimed` attempt restarts it (otherwise the deadline
+   fires at 120 s while a large clone is still running).
+4. **Tokens.** The claim reply carries a second token, `input_token` (`input:get`), next to `http_token`
+   (`artifacts:put`), because a token has one verb. A new `corral.api.<who>.artifacts` verb returns an
+   `artifacts:get` token and a `log:get` token ("minted in NATS replies ... the `artifacts` CLI call", PROTOCOL.md
+   section 10; the verb was missing from the subject table).
+5. **Log completeness.** `finished` reports the final sequence number of each log stream (`log_seq`), the scheduler
+   stores it as `log_final` and repeats it in the terminal job event. `corral wait` ends when it has seen every stream
+   to that sequence, with a 5 s grace for logs that expired or never existed.
+6. **Presence.** Workers write KV `corral_workers.<host>` by publishing to `$KV.corral_workers.<host>` (no bucket
+   lookup, so the permission is exactly the one in PROTOCOL.md 12.1). The scheduler also refreshes presence from every
+   claim, so a worker that only claims is still shown. Offline = no update for `presence_ttl` (60 s).
+7. **Waiting text is computed on read** from presence and the same eligibility function the claim uses, so it is
+   always current (R-ADM-04's 30 s bound holds trivially); declines add the last decline reasons. The `unplaceable`
+   warning at submit is not implemented (workers do not report a static RAM cap).
+8. **Default input.** `corral submit` with neither `--repo/--ref`, `--snapshot` nor `--no-input` takes a snapshot
+   inside a git work tree and no input elsewhere. `--ref` alone uses the `origin` remote; `--repo` alone uses `HEAD`.
+   The snapshot cap (`snapshot_max_mb`) applies to the raw size of the files, checked before archiving.
+9. **Worker defaults.** Caps always include the platform (`linux`, `macos`) and architecture (`x86_64`, `arm64`).
+   Admission floor defaults to 20% of RAM (GUARDS.md 4.1, Linux). Memory already promised to a running job but not yet
+   used (`ram - footprint`) counts against new admissions. One host lock per worker (`<work_dir>/locks/heavy.lock`),
+   taken by heavy jobs with `lock = auto|NAME`.
+10. **Budget watchdog in the worker.** Until the guard exists (M2), the worker kills a job whose footprint exceeds
+    `ram * 1.1` with `ram_exceeded` (the guard's R-GUARD-06 number, not the 1.25 "guard down" backstop). The footprint is
+    the RSS sum of the job's process group and recorded descendants (`ps`), which over-counts shared pages and so
+    errs on the safe side; `phys_footprint` and PSS arrive with the guard.
+11. **Priority.** Non-exclusive heavy jobs run under `nice -n 10`. `ionice`, `cpu.weight`, `taskpolicy -b` and the
+    per-attempt cgroup (R-EXEC-03, R-EXEC-04) are deferred; the budget watchdog applies everywhere.
+12. **Restart recovery (T-Q5).** A restarted worker does not adopt a live process group: it kills a group whose pid and
+    start time it recorded, then reports `lost_local`, so the fenced requeue applies and two attempts never overlap.
+13. **Scheduler restart.** Replies to mutating requests are kept in SQLite for 10 minutes (idempotency survives a
+    restart). Leases, the claim deadline and orphan times are extended by the measured downtime at start (R-OPS-03).
+14. **Events and the outbox.** Job events are published after the transaction commits, in order, retried until
+    JetStream acks. A crash between commit and publish can lose one event; the `get` reply is always authoritative.
+15. **`listen`** configures the scheduler's HTTP bind addresses (R-SEC-06); the NATS bind address belongs to the
+    `nats-server` configuration, which `corral nats-config` generates for a loopback or overlay address.
+16. **Not in M1:** the NATS micro-service discovery endpoints, `admin kill_switch` (needs the guard; the verb replies
+    `unavailable`), worker-local metrics (R-OPS-02, worker half), `corral config check` printing a source for every
+    key (only the client keys carry one).
+

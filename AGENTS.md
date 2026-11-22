@@ -4,11 +4,15 @@ Rules for AI coding agents (and humans) working in this repo. Read it in full be
 
 ## Status
 
-The project is in its **design phase**. The specs in `docs/` are drafts under owner review.
+The specs in `docs/` were **approved by the owner on 22-Nov-2026**. **Milestone M1 is in progress**: the scheduler,
+NATS wiring, Linux worker, CLI, git/snapshot input, logs, events and artifacts (SPEC.md section 13) are implemented;
+the end-to-end and chaos rubric (TESTING.md) has not been run and the owner has not accepted the milestone yet. Later
+milestones (M2 and on) stay unimplemented until their turn; the round-2 drafts (exec, classifier, agent jobs,
+external tokens) are still drafts.
 
-- **No implementation work until the owner has approved the relevant spec.**
-- A spec you wrote yourself is not an approved spec.
-- If a task seems to need code, write or update the spec and stop.
+- Implement approved specs only, one milestone at a time, with tests that cite requirement IDs.
+- A spec you wrote yourself is not an approved spec. When code and spec disagree, change the spec first.
+- Where the spec is ambiguous, pick a sensible default and record it as a short "Implementation note" in the spec.
 
 ## What corral is
 
@@ -53,6 +57,9 @@ The product summary is in `README.md`; the specs are in `docs/`.
 
 ## Tests
 
+- Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` before every commit.
+- Integration tests need a `nats-server` binary (see `README.md`, "Development").
+
 - Unit tests must not touch real system state.
   - Fake the clock, the memory and pressure readers, idle time, power and thermal state, and the locks behind traits.
   - Never use real system signals other than on processes the test itself started.
@@ -61,7 +68,7 @@ The product summary is in `README.md`; the specs are in `docs/`.
 - Chaos and end-to-end rubrics live in `docs/`. Chaos tests run only in a sandbox (temporary directories, test-only
   NATS accounts), never against a live installation unless the owner explicitly asks.
 
-## Layout (planned)
+## Layout
 
 ```
 docs/            specs (SPEC.md, protocol, admission, test rubrics)

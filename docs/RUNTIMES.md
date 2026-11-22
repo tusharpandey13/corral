@@ -1,6 +1,6 @@
 # corral: runtimes
 
-Status: **draft for owner review (v0.1, 22-Nov-2026).** Companion to `docs/SPEC.md`. v1 ships one runtime,
+Status: **approved by the owner (v0.1, 22-Nov-2026); round-2 drafts excepted.** Companion to `docs/SPEC.md`. v1 ships one runtime,
 `native`. The `Runtime` interface is fixed now so that phase-2 cloud runtimes plug in without changing the scheduler,
 protocol or CLI. Cloud runtimes are a **TODO list** here (§4), deliberately not designed in detail (owner decision,
 22-Nov).
