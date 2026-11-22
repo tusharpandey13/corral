@@ -1,6 +1,6 @@
 # corral: design spec
 
-Status: **approved by the owner on 22-Nov-2026 (v0.1); milestone M1 implemented, later milestones not started.** The
+Status: **approved by the owner on 22-Nov-2026 (v0.1); milestones M1 and M2 (guard in observe mode) implemented, later milestones not started.** The
 round-2 sections marked draft (exec, agent jobs, classifier, external tokens) are not part of the approval. Companions:
 
 | Document | Scope |
@@ -948,3 +948,86 @@ owner prefers otherwise.
 25. **Small hardening.** Progress is accepted only from the worker that holds the job; `artifacts_max_mb` has a
     scheduler-side ceiling (8192) checked at submit and used with saturating arithmetic; the audit (`events`) table is
     pruned with retention.
+
+**M2: `corral guard` in observe mode.** M2 is GUARDS.md section 10.3 phase G0: the guard runs next to the legacy guards, decides, logs what it *would* do, and
+changes nothing. Where the approved text was ambiguous or silent, M2 picked these defaults.
+
+26. **A new crate, `corral-guard`.** The guard must run on hosts with no worker and survive worker restarts (GUARDS.md
+    1), so it is not a module of `corral-worker`. It reuses the worker's lease-file lock and process-table helpers
+    rather than copying them; the CLI depends on it for the `guard`, `admit`, `run` and `lock` commands. One new
+    dependency: `regex` (the `select` fields are regular expressions).
+27. **Observe is the only mode, and the default.** `guard.mode = "enforce"` is rejected at start with a message naming
+    M3 (GUARDS.md 9 shows `enforce` as the example value; this build refuses it). `corral guard run` logs
+    `no process is signalled` at start.
+28. **R-GUARD-10 is structural, not a flag.** The crate contains no signalling code, no `libc`/`nix` dependency and no
+    kill-by-name call, and `crates/corral-guard/tests/no_signals.rs` fails the build if any appears (and lists the only
+    helper programs the probes may run, all read-only). A second test runs the whole engine through shed, critical and
+    the kill switch against a real sentinel process and checks it is alive, not stopped, with the same start time.
+    Enforce mode adds signalling in one place, deliberately, and updates that test. A probe helper that hangs is
+    abandoned (never signalled); after four are stuck, probes report `helpers stuck` instead of starting more.
+29. **What observe "assumes".** Nothing dies in observe mode, so the engine keeps a virtual state: a unit it decided to
+    kill counts as gone for the rest of the episode, and the next tier follows after `settle` exactly as if the kill
+    had worked and memory had not recovered. Such decisions say so in `detail` (`assuming the previous tier's kill took
+    effect`). Expect the comparison to show corral-only tier 2/3 decisions where the legacy guard stopped after tier 1
+    because its kill worked; the first decision of each episode is the one that must match.
+30. **The ladder follows the current sample, the level follows hysteresis.** Kills, pauses and the shed ladder act on
+    what the latest sample alone says (`LevelInfo.raw`); the reported level still clears after `clear_samples`. This is
+    how "stop as soon as the level clears" (GUARDS.md 2.2) and "a level clears only after 3 samples" both hold.
+31. **macOS `shed` also triggers at kernel pressure level 4.** The legacy macOS script acts at pressure 4 as well as at
+    free <= 15% or swap >= 7 GiB; GUARDS.md 2.2 lists neither under `shed`, so `shed` gets `pressure_at_least = 4` by
+    default (a candidate spec edit).
+32. **Units.** The first matcher (in file order) that matches a process takes it. A `group` unit is the whole process
+    group only when the group's leader is itself matched (or registered); otherwise the unit is the matched process and
+    its descendants, so a user's interactive shell that shares a group is never part of a kill. A unit with any `never`
+    member (built-in or configured) is never acted on, and is not counted as heavy work for the slot count (the legacy
+    script excluded the owner's own emulator from "a heavy job is running"). A registration no matcher selects is an
+    implicit tier-1 unit. Built-in `never`: pid 1, the guard and its ancestors, and processes named `corral`,
+    `nats-server`, `launchd`, `systemd`, `loginwindow`, `WindowServer`. `exe` falls back to argv[0] without `/proc`.
+33. **Hooks and `protect`.** In observe mode restore hooks are planned (`would_hook`) and never run. A matcher's
+    `protect.resolve_cmd` *is* run (cached for `ttl`, 5 s timeout): it is a read-only inspection command the operator
+    configured, and "protected set unresolved" is exactly what the comparison must show. A unit is protected when an
+    id equals one of its pids or is contained in its cgroup path or command line.
+34. **Admission is real in observe mode.** `corral admit` answers from the live state (a legacy caller keeps using the
+    legacy script until G1/G2, but a corral caller can rely on the answer), and `corral run` honours it. The kill
+    switch in observe mode writes the persistent state, refuses admission and logs the kills it would make; it
+    signals nothing and says so. Only decisions about *signals* are withheld. Heavy slots are counted from live matches
+    (not `never`), live registrations and reservations; `class light` checks only the kill switch and memory (no light
+    slot yet: R-ADM-08 is a draft); `admit` accepts only the `default` profile (`measurement`/`gui` are M4), and
+    `checks` (profile `default` or `all`) additionally reports `user_idle` stage 1 and `lock_free:<name>` for each
+    configured lock. A memory probe that fails makes `memory` fail (`on_unknown = fail`).
+35. **Reservations** live in memory (60 s typical) and are lost on a guard restart; registrations persist. `admit` takes
+    an optional `reservation` (the re-check under the lock evaluates as if that reservation were not holding RAM and a
+    slot) and the socket gained `unreserve {token}`, so a declined `corral run` frees its hold at once.
+36. **Probes.** Linux: `/proc/meminfo`, PSI `full avg10`, hwmon (`coretemp` / `Package id 0` by default, or a thermal
+    zone), `loginctl show-session auto` for idle (a host without a session reports `unknown`, a `pass`/`fail` per
+    check), `/sys/class/power_supply` for AC. macOS: `sysctl` (`kern.memorystatus_level`, `vm.swapusage`,
+    `kern.memorystatus_vm_pressure_level`), `pmset -g therm` (the CPU speed limit mapped to nominal/fair/serious/critical:
+    coarse, the process thermal state needs an API the `unsafe`-free build cannot call), `ioreg` `HIDIdleTime`, `pmset -g
+    batt`. Memory per unit is the RSS sum from `ps`; `phys_footprint` (macOS) and PSS / cgroup `memory.current` (Linux)
+    are not read yet (they need `unsafe` or per-OS helpers; the 1.1 slack stays). Thermal, idle and power are
+    refreshed every 5 s, memory every `sample` (2 s).
+37. **The socket.** Mode 0660; the caller must be the guard's own uid or root (`SO_PEERCRED` through tokio's `peer_cred`);
+    the configured-group rule needs a group lookup and waits for the deployment step. `lock.acquire|renew|release`,
+    `hold`, `release_hold` and `holds` reply `unavailable` naming M3: locks are taken with `corral lock` on the lease
+    file itself (no guard needed, interoperable with the legacy tool), and guard-held locks and keep-awake holds come
+    with enforce mode. `lock.status`, `explain`, `metrics` (Prometheus text, over the socket: R-OPS-02 guard half) and
+    `subscribe` (topics `actions`, `level`; events are the decision lines) exist. `corral run --hold` warns and runs
+    without a hold.
+38. **Locks (`corral lock`).** Kind `lease` only (a `flock` lock in the config is rejected naming M4). Re-entry: the
+    holder records the SHA-256 of `CORRAL_LOCK_TOKEN` in the lease file's `corral` extras key, never the token; a child
+    that presents it re-enters and releases nothing. `takeover = corral|any|never` per lock; `on_takeover` hooks are
+    not run (M3). `corral lock acquire` without `exec` records no token (nothing can export it).
+39. **The decision log** (`<state_dir>/decisions.jsonl`, 10 MB x 3, mode 0600) is the comparison format: one JSON line
+    per decision with `v`, `t_ms`, `t`, `host`, `mode`, `kind` (`level`, `would_kill`, `would_pause`, `would_resume`,
+    `would_hook`, `skipped`, `admit`, `stop`, `resume`), `level`, `tier`, `matcher`, `unit`, `pids`, `comm` (the program
+    base name only, never arguments, which may hold secrets), `reason` (`system_memory`, `thermal`, `ram_exceeded`,
+    `kill_switch`, ...) and `detail` (the measurements and the rule). `corral guard compare --legacy FILE` reads a
+    legacy text log (`YYYY-MM-DD HH:MM:SS message`, host-local time, `--utc-offset` to override) and matches each
+    legacy action to corral decisions of the same kind (and tier) within `--window` (10 s): legacy-only actions are
+    the G0 failures (exit 1); corral-only decisions are for the owner to judge. The shapes understood are listed in
+    `crates/corral-guard/src/compare.rs`; unrecognised legacy lines are counted and reported.
+40. **Not in M2:** notifications (no `Notifier` yet; observe mode would send nothing anyway), restore-hook execution,
+    `corral guard await` / `stamp-synthetic`, the shims and `--legacy-output` for `guard status` (M3), the exit-125
+    report when the guard kills a `corral run` command (nothing is killed in observe), per-unit cgroup freeze, the
+    worker registering its jobs with the guard (M3), and the worker's own budget watchdog stays as it is.
+

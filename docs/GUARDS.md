@@ -53,7 +53,7 @@ The guard computes one level per sample. Each level has a condition (any listed 
 | `ok` | — | — | none |
 | `closed` | free < 40% or swap > 4 GiB or pressure ≥ 2 | MemAvailable < 5 GiB or temp ≥ 85 C | admission refused (no kill) |
 | `pressure` | free ≤ 22% or pressure ≥ 2 or swap ≥ 6 GiB, 3 samples | MemAvailable < 2.25 GiB or PSI `full avg10` > 20 or temp ≥ 92 C, 3 samples | pause `pausable` registrations (SIGSTOP group / `cgroup.freeze`); resume when clear (free ≥ 30% and pressure 1 / MemAvailable ≥ 3 GiB) within `pause_max` (60 s memory, 10 min thermal), else escalate those registrations to a kill (`system_memory` / `thermal`) |
-| `shed` | free ≤ 20% (the 80% ceiling) | MemAvailable < 2 GiB or temp ≥ 95 C | kill **one tier at a time**, lowest first, excluding `protected` and `never`; wait `settle` (8 s) and re-sample after each tier; stop as soon as the level drops below `shed` |
+| `shed` | free ≤ 20% (the 80% ceiling) or pressure ≥ 4 | MemAvailable < 2 GiB or temp ≥ 95 C | kill **one tier at a time**, lowest first, excluding `protected` and `never`; wait `settle` (8 s) and re-sample after each tier; stop as soon as the level drops below `shed` |
 | `critical` | free ≤ 15% or swap ≥ 7 GiB | MemAvailable < 768 MiB or temp ≥ 99 C | kill every watched process except `never`, including `protected`; run restore hooks |
 | `stop` | kill switch on | kill switch on | as `critical`, every sample while matches appear; admission refused |
 
@@ -367,6 +367,9 @@ work is refused with `keepawake_unavailable` (R-AWAKE-03).
 [guard]
 mode = "enforce"               # enforce | observe (log decisions, signal nothing: R-GUARD-10)
 sample = "2s"
+socket = "/run/corral/guard.sock"     # default: the runtime directory (§6)
+pause_max = "60s"; pause_max_thermal = "10m"; clear_samples = 3
+disk_path = "/var/lib/corral"; min_disk = "15G"; admit_max_c = 85   # disk_free and thermal_ok checks
 kill_grace = "8s"
 settle = "8s"
 budget_slack = 1.1
@@ -377,7 +380,7 @@ state_dir = "/var/lib/corral/guard"   # STOP state, registrations, last real inp
 [guard.levels.macos]           # defaults shown; any key may be overridden
 closed   = { free_pct_below = 40, swap_above = "4G", pressure_at_least = 2 }
 pressure = { free_pct_at_most = 22, pressure_at_least = 2, swap_at_least = "6G", for_samples = 3 }
-shed     = { free_pct_at_most = 20 }
+shed     = { free_pct_at_most = 20, pressure_at_least = 4 }
 critical = { free_pct_at_most = 15, swap_at_least = "7G" }
 admit_floor_free_pct = 23
 
