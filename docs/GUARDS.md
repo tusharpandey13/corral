@@ -37,7 +37,7 @@ with no worker, and while the worker restarts or upgrades.
 | memory pressure | `kern.memorystatus_vm_pressure_level` (1 normal, 2 warn, 4 critical); dispatch-source events as accelerator | PSI `/proc/pressure/memory` `some`/`full` `avg10`; PSI triggers as accelerator |
 | swap used | `vm.swapusage` | `SwapTotal − SwapFree` |
 | thermal | process thermal state (`nominal`/`fair`/`serious`/`critical`); `pmset -g therm` fallback | configured sensor: hwmon `coretemp` "Package id 0" by default, or a thermal zone; °C |
-| per-process memory | `proc_pid_rusage` `ri_phys_footprint` (includes GPU/unified memory that RSS misses) | cgroup `memory.current` when the process has its own cgroup; else `smaps_rollup` PSS |
+| per-process memory | **RSS** summed over the unit (`ps`); `ri_phys_footprint` (GPU and compressed memory) needs a native call and is not built, so a unit that is mostly GPU or compressed memory is under-measured and the system level is the backstop (SPEC 17.3 note 48) | cgroup `memory.current` when the process has its own cgroup; else `smaps_rollup` PSS |
 | process tree | process group + ppid walk each sample (children that `setsid`) | cgroup membership, else process group + ppid walk |
 
 Sampling every `sample` (default 2 s) for memory, 5 s for thermal. Every probe sits behind a trait so tests inject
@@ -97,10 +97,12 @@ Other matcher keys:
 
 - **`[[guard.never]]`**: same `select` syntax. A process matched by any `never` rule is never signalled, at any
   level, by the kill switch included (e.g. the user's own emulator instance, the agent runtime itself, the guard and
-  worker). `never` always wins over matchers.
+  worker). `never` always wins over matchers. Built in: corral's own daemons by role (`corral scheduler`, `worker`,
+  `guard run`), the guard itself and its ancestors, and the system processes; a process that only runs some other
+  `corral` subcommand is not `never` (SPEC 17.3 note 52).
 - **`protected`**: a matcher flag, or a `protect` block on a matcher:
   `protect = { resolve_cmd = ["container-cli", "inspect", "-f", "{{.Id}}", "prod-1"], ttl = "60s" }` produces ids
-  (pids, cgroup names or container ids) to protect. Protected units die only at `critical` or `stop`.
+  (pids, cgroup names or container ids) to protect. Protected units die only at `critical` or `stop`; they are not paused either (pause_max would turn it into a kill).
 - **Fail-safe:** if a matcher has a `protect` block and resolution fails or returns nothing, `shed` kills **nothing**
   from that matcher (it logs `shed skipped: protected set unresolved`); `critical` still applies (R-GUARD-03).
 
@@ -117,7 +119,8 @@ Other matcher keys:
 
 - `corral guard stop [--reason R]`: writes the persistent `STOP` state (survives restarts and reboots), kills every
   watched non-`never` unit, runs restore hooks, refuses all admission (`refused: kill switch on (since T, by X: R)`),
-  and tells the local worker to report affected jobs `killed:kill_switch`.
+  and tells the local worker to report affected jobs `killed:kill_switch`. The switch fails safe: a `STOP` file that is
+  there but cannot be read or parsed counts as ON.
 - `corral guard resume`: clears it. Both are logged and notified. The scheduler's `admin kill_switch` forwards to every
   online guard; offline guards get it on reconnect (sticky until `resume`).
 - **Round 3 (draft, SPEC R-JPROF-18): approval levels.** With external authorization configured, the directions
