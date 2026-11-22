@@ -38,6 +38,7 @@ test IDs here.
 | INV-6 | Nothing left behind. | After cleanup: no corral-created process, keep-awake hold, host lock file, reservation, cgroup, temp dir or NATS consumer remains. | R-AWAKE-01, R-LOCK-03 |
 | INV-7 | No secret in any output. | A canary secret is placed in the submitter's environment and in an ignored `.env`; it must not appear in job env dumps, logs, archives, artifacts, metrics or notifications. | R-EXEC-05, R-IO-02 |
 | INV-8 | State is consistent. | Scheduler SQLite `PRAGMA integrity_check` = `ok`; every job's state is reachable by the PROTOCOL.md §5 table from its event history. | R-QUEUE-02, R-QUEUE-03 |
+| INV-9 | (draft, round 3) On a worker with `job_profiles = "required"`, no job process runs as the worker's uid. | At 1 Hz the harness lists process groups tagged `CORRAL_JOB` on such a worker; each runs as the runner uid of its instance's profile. INV-7 there also checks that no secret value or ciphertext appears in scheduler state, bus traffic, logs, artifacts or patches, and that proposal output holds no canary. | R-JPROF-01, R-JPROF-07, R-JPROF-12, R-JPROF-16 |
 
 An invariant failure fails the test **and** is a severity S1 finding (§9), whatever the test was about.
 
@@ -104,6 +105,13 @@ Unit tests run with `cargo test` on macOS (aarch64) and Linux (x86_64) and must 
 | U-34 | (draft) Sync-back: patch of tracked + untracked-not-ignored changes; ignored paths only via `pull`; conflicting caller edit → patch kept, not applied | R-REXEC-05 |
 | U-35 | (draft) Light vs heavy admission with fakes: user active + battery → light admitted, heavy refused `ac_power` | R-ADM-08 |
 | U-36 | (draft) External token validation: valid DPoP-bound token; replayed `jti`; proof key ≠ `cnf.jkt`; wrong `htu`/`htm`; stale `iat`; wrong audience; expired; unknown issuer key | R-SEC-07 |
+| U-JP-01 | (draft, round 3) Matching corpus: exact prefix matches; near misses (case, homoglyph, abbreviation, trailing `;`, empty token, NUL); args deny globs incl. `--opt=value`; env deny incl. cache variables; cwd escape by `..` and by symlink; forbidden `prefix[0]` set | R-JPROF-03 |
+| U-JP-02 | (draft) Closed schema: each missing and each unknown field refused; caps; 4 KiB limit; `run_as` derived from `profile_id`; `secrets` other than `none` refused; `cache.stores` outside `npm`/`cargo`/`pip` refused; rendering golden file in schema order with `purpose` last | R-JPROF-02, R-JPROF-16, R-JPROF-19 |
+| U-JP-03 | (draft) Digest: one-byte change → new digest; rev monotonic; `replaces` must equal the installed digest | R-JPROF-05 |
+| U-JP-04 | (draft) Light/heavy line and hook decisions with `placement.job_profiles = "required"`: weight vs `wait_threshold`; heavy matched → rewrite; heavy unmatched → deny + `profile_miss` (online and offline); light unknown → light envelope; escape hatch denied on heavy; mixed command with one unmatched heavy segment → whole command denied | R-JPROF-13, R-PLACE-03, R-PLACE-05 |
+| U-JP-05 | (draft) Proposal redaction: canaries in argv, env, URLs, heredocs and high-entropy names never appear; below `--min-sessions` nothing proposed; file mode 0600 | R-JPROF-12 |
+| U-JP-06 | (draft) Approval levels: defaults; `approve` or unsafe admin below 2 refused by config check; level 0 needs no grant; safe vs unsafe admin direction mapped correctly | R-JPROF-18 |
+| U-JP-07 | (draft) Cargo import/publish logic over a fake pool: import only lockfile crates with a matching hash of the private copy; publish only hashes listed in the lockfile; non-crates.io and git sources ignored | R-JPROF-20 |
 
 ### 3.3 Lock conformance (LC)
 
@@ -165,6 +173,45 @@ test's process tree (§10, `sandbox_scope`), so a real kill can only reach proce
 | IT-37 | (draft) `agent` slot cap + 1 → one `queued` with `agent slots full`; deadline with `fallback = wait` → one notification; `fallback = local` → local start | R-AGENT-03, R-AGENT-04 |
 | IT-38 | (draft) Hook mode against a fake harness: rewrite produces an exec that returns the original exit code; target offline: heavy → queued job + exit 75, unknown → guarded local run killed at its timeout and logged | R-PLACE-03, R-PLACE-04 |
 | IT-39 | (draft) External issuer stub (temp JWKS): HTTP artifacts read with a DPoP-bound token; NATS connect through the auth callout with a token; each U-36 rejection case end to end | R-SEC-07 |
+| IT-JP-01 | (draft, round 3) Fake installer: install, refuse for each check (expiry, replay, rollback, host, unsafe `run_as`, `exe` in a home, unenforceable value), remove; a forced mid-way failure leaves no user, group, directory or service entry; presence lists `id@rev:digest` | R-JPROF-05, R-JPROF-06 |
+| IT-JP-02 | (draft) Workspace sync into a runner workspace: dirty and deleted files reflected; ignored cache kept; stray file from an earlier instance reset; `.env` never sent; base via bundle | R-JPROF-08 |
+| IT-JP-03 | (draft) Files out: patch applied; `--pull` outside `sync_out.pull` refused; symlink pull refused; translated display vs raw log | R-JPROF-09 |
+| IT-JP-04 | (draft) Lease cap: above-cap lease → `bad_request`; `sleep` past lease → `killed:timeout` | R-JPROF-10 |
+| IT-JP-05 | (draft) Revocation: disable mid-step → `cancelled:profile_revoked`; expiry mid-step finishes; dispatch after `remove` declined by the worker | R-JPROF-11 |
+| IT-JP-06 | (draft) Agent profile with a fake runner: runs as its runner uid; bundle pushed by the worker; cap + 1 queues; `fallback = local` refused | R-JPROF-14, R-AGENT-04 |
+| IT-JP-07 | (draft) Plain submit and `mirror` exec to a `required` worker declined (`job_profile`, mirror refused) | R-JPROF-01, R-REXEC-04 |
+| IT-JP-08 | (draft) Hook against a fake harness with `job_profiles = "required"`: matched heavy runs on the target; unmatched heavy denied with the hint and logged, nothing runs anywhere; light unknown runs in the light envelope and is killed at its timeout | R-JPROF-13 |
+| IT-JP-09 | (draft) Shared cache, npm: two profiles in one group; the second hydrates offline from the first's downloads; indexes stay separate; a miss → `deps_missing` and no `node_modules` left | R-JPROF-19, R-JPROF-20 |
+| IT-JP-10 | (draft) Shared cache, cargo and pip with a local registry stub: import and publish by lockfile hash; pip installs only with hashes | R-JPROF-20 |
+| IT-JP-11 | (draft) Cache GC: over-limit store shrinks to ≤ 80%; corrupt entry deleted and reported with the owning profile; entries younger than 10 min kept; publish refused under the free-space floor | R-JPROF-21 |
+| IT-JP-12 | (draft) Scheduler least privilege: static check of no process spawn; config check warns on readable credentials | R-JPROF-15 |
+
+### 4.1 Security suite for job profiles (SEC-JP, draft, round 3)
+
+Run on a real host with real runner users (macOS and Linux), in the sandbox of §7.1. Each case is MUST.
+
+| ID | Attempt | Expect | Spec |
+|---|---|---|---|
+| SEC-JP-01 | argv `["npm","test;","rm","-rf","~"]` and `["npm","test && curl x"]` | no match; no shell is ever executed by the launcher (static test) | R-JPROF-03 |
+| SEC-JP-02 | case, homoglyph, abbreviation, double space, trailing NUL variants of the prefix | refused | R-JPROF-03 |
+| SEC-JP-03 | `argv[0]` as `./npm`, `/tmp/npm`, a planted workspace binary | refused; only `exe` runs | R-JPROF-03 |
+| SEC-JP-04 | env injection: `PATH`, `NODE_OPTIONS`, `DYLD_INSERT_LIBRARIES`, `LD_PRELOAD`, `PYTHONSTARTUP`, `BASH_ENV`, `GIT_SSH_COMMAND` | refused | R-JPROF-03 |
+| SEC-JP-05 | interpreter `-c`, module look-alikes, script outside the workspace | refused | R-JPROF-03 |
+| SEC-JP-06 | cwd escape by `..`, absolute path, workspace symlink | refused | R-JPROF-03 |
+| SEC-JP-07 | profile requests with `prefix[0]` a shell, `env`, `xargs`, `sudo`, an OS script host, or `exe` under a home | refused at request; a forged one fails at the installer | R-JPROF-03, R-JPROF-06 |
+| SEC-JP-08 | overlong argv; more args than `args.max` | refused | R-JPROF-03 |
+| SEC-JP-09 | `bash -lc "npm test"` through the hook | unwrapped; no shell reaches the worker | R-JPROF-13 |
+| SEC-JP-10 | a repository test script reads other users' files and opens a network connection under `network: none` | both fail; the job shows the failures | R-JPROF-04 |
+| SEC-JP-11 | the runner reads the worker's credentials | EACCES | R-JPROF-07 |
+| SEC-JP-12 | the runner signals or debugs a worker-owned process | EPERM | R-JPROF-07 |
+| SEC-JP-13 | the runner writes another runner's workspace | EACCES | R-JPROF-07 |
+| SEC-JP-14 | the runner reads another runner's home, including its package-cache index | EACCES | R-JPROF-07, R-JPROF-19 |
+| SEC-JP-15 | **Cache poisoning, npm:** a group member overwrites a shared content entry that another member needs with a trojan whose install script writes a canary | the consumer's install fails its integrity check, the canary never exists, no partial `node_modules` is used; GC deletes the entry and reports the member's profile | R-JPROF-19..21 |
+| SEC-JP-16 | **Cache poisoning, cargo:** a member writes a trojan crate into the pool under the real hash of a crate another member needs, and swaps it again during the import | import rejects the private copy (`cache_reject` names the member); the trojan's build script canary never appears | R-JPROF-20, R-JPROF-21 |
+| SEC-JP-17 | **Malicious lockfile:** a member publishes a trojan under a hash its own lockfile names for a popular crate | another member, with the real lockfile, never imports it | R-JPROF-20 |
+| SEC-JP-18 | **Cache poisoning, pip:** a member replaces a cached wheel body | the consumer's hash-checking install fails; nothing installed | R-JPROF-20 |
+| SEC-JP-19 | caller tries to redirect or unverify a store (env, workspace `.npmrc`, user config file) | env refused; `.npmrc` refused `cache_config_override`; config ignored | R-JPROF-20 |
+| SEC-JP-20 | a runner outside the group, and a member of another group, read the store | EACCES | R-JPROF-19 |
 
 ---
 
@@ -207,6 +254,7 @@ and between each client and the HTTP port, so network faults can be injected wit
 | E-15 | (draft, round 2) Placement end to end: a scripted agent session on `server` with the hook in `observe` then `rewrite` mode runs a mixed command set; `laptop` online, then frozen (sleep) | observe changes nothing and logs every decision; rewrite runs heavy commands on `laptop` with exit codes preserved; with `laptop` asleep heavy commands are queued (exit 75) and run on wake; unknown commands run on `server` under guard | R-PLACE-*, R-REXEC-01 |
 | E-16 | (draft) Agent job from `server` to `laptop`, `laptop` frozen mid-run past `orphan_grace` | job `lost` → requeued per policy; the stale attempt's runner is killed on wake (`stale_lease`); never two agents on one branch | R-AGENT-*, R-QUEUE-05, R-QUEUE-06, INV-3 |
 | E-17 | (draft) Light vs heavy on `laptop` with a fake active user on battery: light exec and an agent job run; heavy exec waits with `ac_power` | as stated; INV-5 holds | R-ADM-08 |
+| E-JP-01 | (draft, round 3) Placement with job profiles: the E-15 session with `job_profiles = "required"` on both sides and two approved profiles (fake authorization server) | matched heavy commands run on `laptop` as their runners; unmatched heavy commands are denied with the hint and logged `profile_miss`, online and while `laptop` sleeps; light commands run on `server`; INV-9 holds | R-JPROF-*, R-PLACE-* |
 
 ---
 
@@ -493,6 +541,15 @@ Format per case: **Inject** (sandbox / live), **Expect** (with IDs), **Assert** 
   command that ends or lists-and-kills all keep-awake processes.
 - **Cleanup:** release test holds by name; INV-6.
 
+### CH-JP-01..04 Job profiles (draft, round 3)
+
+| ID | Inject | Expect |
+|---|---|---|
+| CH-JP-01 | Kill a launcher mid-instance | the job ends `lost` (exit 125) and never re-runs on its own; the service manager restarts the launcher; INV-1 |
+| CH-JP-02 | Fill a runner workspace past `max_gb`, and a shared cache store past its limit | instance killed `disk_exceeded`; GC shrinks the store; the host volume keeps its free-space floor |
+| CH-JP-03 | Flood the installer inbox with 1,000 junk requests | each refused cheaply; installed profiles unaffected |
+| CH-JP-04 | Authorization server down during a profile request, with profiles installed | `profiles request` exits 75; installed profiles keep running (offline verification) |
+
 ---
 
 ## 7. Running chaos safely
@@ -616,6 +673,16 @@ severity of any failure, follow-up. Failures are reported before any cleanup tha
 | R-REXEC-06 (draft) | | IT-35 | | |
 | R-AGENT-01..05 (draft) | | IT-36, IT-37 | E-16 | |
 | R-PLACE-01..07 (draft) | U-29..U-32 | IT-38 | E-15 | |
+| R-JPROF-01..03 (draft) | U-JP-01, U-JP-02 | IT-JP-07 | E-JP-01 | SEC-JP-01..09 |
+| R-JPROF-04, R-JPROF-07 (draft) | | | | SEC-JP-10..14 |
+| R-JPROF-05, R-JPROF-06 (draft) | U-JP-03 | IT-JP-01 | | CH-JP-03, CH-JP-04 |
+| R-JPROF-08..11 (draft) | | IT-JP-02..05 | | CH-JP-01, CH-JP-02 |
+| R-JPROF-12 (draft) | U-JP-05 | | | |
+| R-JPROF-13 (draft) | U-JP-04 | IT-JP-08 | E-JP-01 | SEC-JP-09 |
+| R-JPROF-14 (draft) | | IT-JP-06 | | |
+| R-JPROF-15..17 (draft) | | IT-JP-12 | | all (INV-7, INV-9) |
+| R-JPROF-18 (draft) | U-JP-06 | | | |
+| R-JPROF-19..21 (draft) | U-JP-07 | IT-JP-09..11 | | SEC-JP-15..20, CH-JP-02 |
 
 Every requirement has at least one test. Requirements whose only coverage is a unit test with fakes (R-QUEUE-07,
 R-SEC-04, R-RT-*) are acceptable because they have no system-level behaviour to break.
