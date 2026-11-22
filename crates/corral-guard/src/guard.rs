@@ -305,6 +305,9 @@ impl Guard {
         g.table_ok = units.is_some();
         g.units = units.unwrap_or_default();
         g.sample = sample;
+        // a claimed reservation ends once a sample shows its unit (the unit counts for itself from then on)
+        let seen: Vec<String> = g.units.iter().filter_map(|u| u.reg_id.clone()).collect();
+        g.reservations.retain(|r| r.claimed_by.as_ref().is_none_or(|id| !seen.contains(id)));
         if let Some(x) = &self.exec {
             x.set_level(g.engine.level().name());
         }
@@ -409,6 +412,7 @@ impl Guard {
                 ram_mb: req.ram_mb,
                 heavy: req.class == Class::Heavy,
                 until_ms: until,
+                claimed_by: None,
             });
             reply["reservation"] = json!(token);
             reply["until_ms"] = json!(until);
@@ -469,9 +473,6 @@ impl Guard {
         if let Some(r) = g.regs.iter().find(|r| r.pgid == pgid as u32 && r.pid_start == start) {
             return json!({ "v": 1, "ok": true, "id": r.id });
         }
-        if let Some(tok) = v.get("reservation").and_then(Value::as_str) {
-            g.reservations.retain(|r| r.token != tok);
-        }
         let r = Registration {
             id: random_b32(10),
             name: name.to_string(),
@@ -487,7 +488,16 @@ impl Guard {
         let id = r.id.clone();
         g.regs.push(r);
         if let Err(e) = self.state.save_regs(&g.regs) {
+            // not registered means not registered: the reservation stays with the caller, who releases it (L1)
+            g.regs.retain(|r| r.id != id);
             return err(format!("cannot persist registrations: {e}"));
+        }
+        // The reservation is not dropped now: until a sample has seen the unit (and its memory), it still counts for
+        // its slot and its RAM, or a second heavy job is admitted into the gap (M2).
+        if let Some(tok) = v.get("reservation").and_then(Value::as_str) {
+            for r in g.reservations.iter_mut().filter(|r| r.token == tok) {
+                r.claimed_by = Some(id.clone());
+            }
         }
         json!({ "v": 1, "ok": true, "id": id })
     }
@@ -495,6 +505,7 @@ impl Guard {
     fn unregister(&self, id: &str) -> Value {
         let mut g = self.lock();
         g.regs.retain(|r| r.id != id);
+        g.reservations.retain(|r| r.claimed_by.as_deref() != Some(id));
         let _ = self.state.save_regs(&g.regs);
         json!({ "v": 1, "ok": true })
     }

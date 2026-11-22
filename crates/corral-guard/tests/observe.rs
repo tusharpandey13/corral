@@ -251,3 +251,73 @@ async fn socket_protocol_end_to_end() {
     server.await.unwrap().unwrap();
     assert!(!sock.exists(), "the socket file is removed on shutdown");
 }
+
+const START: &str = "Mon Nov 22 10:00:00 2026";
+
+fn heavy_admit(rig: &Rig, name: &str) -> serde_json::Value {
+    rig.guard.handle(&json!({ "v": 1, "op": "admit", "name": name, "ram_mb": 100, "class": "heavy", "reserve_s": 600 }))
+}
+
+fn job_proc(pid: u32) -> corral_guard::procs::ProcInfo {
+    corral_guard::procs::ProcInfo { pid, ppid: 1, pgid: pid, rss_kb: 1024, user: "u".into(), start: START.into(), cmdline: "job".into() }
+}
+
+/// M2 (note 41, R-ADM-01): registering hands the reservation over, but the slot and the RAM stay counted until a
+/// sample has seen the unit; a second heavy admit in that gap is refused. After the sample the unit counts for itself
+/// and the reservation is gone; unregistering frees the slot.
+#[test]
+fn a_registered_job_keeps_its_slot_until_a_sample_sees_it() {
+    let rig = Rig::new("");
+    *rig.procs.table.lock().unwrap() = vec![job_proc(4242)];
+    rig.tick();
+    let a = heavy_admit(&rig, "corral:j:1");
+    assert_eq!(a["ok"], true, "{a}");
+    let tok = a["reservation"].as_str().unwrap().to_string();
+    let r = rig.guard.handle(&json!({ "v": 1, "op": "register", "name": "corral:j:1", "pid": 4242, "pgid": 4242, "pid_start": START, "heavy": true, "reservation": tok }));
+    assert_eq!(r["ok"], true, "{r}");
+    let id = r["id"].as_str().unwrap().to_string();
+    let b = heavy_admit(&rig, "second");
+    assert_eq!(b["ok"], false, "the slot is not free between register and the next sample: {b}");
+    assert!(b["reasons"].to_string().contains("heavy_slot"), "{b}");
+    rig.tick();
+    let st = rig.guard.handle(&json!({ "v": 1, "op": "status" }));
+    assert_eq!(st["reservations"].as_array().unwrap().len(), 0, "the unit counts for itself now: {st}");
+    assert_eq!(heavy_admit(&rig, "third")["ok"], false, "still one heavy unit running");
+    rig.guard.handle(&json!({ "v": 1, "op": "unregister", "id": id }));
+    rig.procs.table.lock().unwrap().clear();
+    rig.tick();
+    assert_eq!(heavy_admit(&rig, "fourth")["ok"], true);
+}
+
+/// M2: unregistering before any sample saw the unit also frees the claimed reservation.
+#[test]
+fn unregistering_frees_a_claimed_reservation() {
+    let rig = Rig::new("");
+    rig.tick();
+    let a = heavy_admit(&rig, "corral:j:1");
+    let tok = a["reservation"].as_str().unwrap().to_string();
+    let r = rig.guard.handle(
+        &json!({ "v": 1, "op": "register", "name": "corral:j:1", "pid": 4242, "pgid": 4242, "pid_start": START, "reservation": tok }),
+    );
+    rig.guard.handle(&json!({ "v": 1, "op": "unregister", "id": r["id"] }));
+    assert_eq!(heavy_admit(&rig, "next")["ok"], true);
+}
+
+/// L1: a registration that cannot be persisted is refused and rolled back; the reservation stays unclaimed so the
+/// caller's `unreserve` frees it.
+#[test]
+fn a_registration_that_cannot_be_saved_is_rolled_back() {
+    let rig = Rig::new("");
+    rig.tick();
+    let a = heavy_admit(&rig, "corral:j:1");
+    let tok = a["reservation"].as_str().unwrap().to_string();
+    std::fs::create_dir(rig.guard.settings.state_dir.join("registrations.json")).unwrap(); // the rename onto it fails
+    let r = rig.guard.handle(
+        &json!({ "v": 1, "op": "register", "name": "corral:j:1", "pid": 4242, "pgid": 4242, "pid_start": START, "reservation": tok }),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    let st = rig.guard.handle(&json!({ "v": 1, "op": "status" }));
+    assert_eq!(st["registrations"].as_array().unwrap().len(), 0, "not half-registered: {st}");
+    rig.guard.handle(&json!({ "v": 1, "op": "unreserve", "token": tok }));
+    assert_eq!(heavy_admit(&rig, "next")["ok"], true);
+}
