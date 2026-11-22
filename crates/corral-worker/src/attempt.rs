@@ -423,10 +423,12 @@ impl<L: SchedLink, R: Runtime> Worker<L, R> {
         });
         // A kill by the host guard carries its reason (R-GUARD-08). The guard announces before it signals, but the
         // event travels on another connection: when the job died of a signal nobody in corral sent, wait briefly.
-        if cause.is_none() && exit.by_runtime.is_none() {
+        // Only an exit that looks like a kill (a signal, or the 128+TERM/KILL a shell reports) can be the guard's: a job
+        // that ended by itself with its own code after the event arrived keeps that code (M4).
+        let kill_like = exit.signal.is_some() || matches!(exit.code, Some(137 | 143));
+        if cause.is_none() && exit.by_runtime.is_none() && kill_like {
             let mut waited = 0;
             while self.adm.guard().is_some()
-                && exit.signal.is_some()
                 && flags.guard_kill.lock().unwrap_or_else(|e| e.into_inner()).is_none()
                 && waited < 30
             {

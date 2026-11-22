@@ -311,6 +311,29 @@ async fn a_guard_kill_carries_the_guards_reason() {
     assert!(g.calls().iter().any(|c| c.starts_with("unregister")), "unregistered when the job ended");
 }
 
+/// M4 (note 47): the guard's kill event does not relabel a job that then ended by itself with an ordinary exit code;
+/// a shell's 143 (128 + TERM) still counts as the kill.
+#[tokio::test]
+async fn a_guard_event_does_not_relabel_a_job_that_exited_on_its_own() {
+    for (code, killed) in [(3, false), (143, true)] {
+        let g = corral_worker::hostguard::FakeGuard::new();
+        let e = env_with(move |_| Behavior::Exit { code, after_ms: 900, stdout: String::new() }, |a| a.with_guard(g.clone()));
+        let id = e.submit(&heavy(100));
+        e.until(&id, &[JobState::Running]).await;
+        e.worker.on_guard_event(&corral_worker::hostguard::GuardEvent {
+            kind: "kill".into(),
+            unit: Some(format!("corral:{id}:1")),
+            reason: "system_memory".into(),
+            detail: String::new(),
+        });
+        let j = e.until(&id, &[JobState::Killed, JobState::Failed, JobState::Succeeded]).await;
+        assert_eq!(j.state == JobState::Killed, killed, "exit {code}: {j:?}");
+        if killed {
+            assert_eq!(j.reason.as_deref(), Some("system_memory"));
+        }
+    }
+}
+
 /// R-ADM-03/04 (M3): a guard refusal never starts the job, counts no attempt, and its reason is what the job waits on.
 #[tokio::test]
 async fn a_guard_refusal_is_the_jobs_waiting_reason() {
