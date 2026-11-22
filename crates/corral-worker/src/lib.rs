@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod attempt;
+pub mod hostguard;
 pub mod input;
 pub mod keepawake;
 pub mod link;

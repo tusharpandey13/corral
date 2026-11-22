@@ -71,16 +71,20 @@ fn tmpdir() -> std::path::PathBuf {
 }
 
 fn env(behavior: impl Fn(&JobSpec) -> Behavior + Send + Sync + 'static) -> Env {
+    env_with(behavior, |a| a)
+}
+
+fn env_with(behavior: impl Fn(&JobSpec) -> Behavior + Send + Sync + 'static, wire: impl FnOnce(Admitter) -> Admitter) -> Env {
     let clock = Arc::new(FakeClock::new(T0));
     let (svc, _rx) = Service::new(Settings::for_dir(tmpdir()), Store::open_memory(), clock.clone(), b"k".to_vec());
     std::mem::forget(_rx); // keep the outbox open; nothing consumes it in these tests
     let rt = FakeRuntime::new(behavior);
     let mem = FakeMemory::constant(16_000, 12_000);
-    let adm = Arc::new(Admitter::new(
+    let adm = Arc::new(wire(Admitter::new(
         AdmitConfig { heavy_slots: 1, light_slots: 2, ram_cap_mb: None, admit_floor_mb: Some(1000), lock_ttl_s: 300 },
         mem.clone(),
         Arc::new(FakeLock::default()),
-    ));
+    )));
     let mut st = WorkerSettings::for_dir("w1", tmpdir(), "http://127.0.0.1:1");
     st.hb_interval_ms = 50;
     st.kill_grace_ms = 200;
@@ -284,4 +288,63 @@ async fn unmeasurable_footprint_fails_closed() {
     let id = e.submit(&heavy(100));
     let j = e.until(&id, &[JobState::Killed]).await;
     assert_eq!(j.reason.as_deref(), Some("ram_exceeded"));
+}
+
+/// R-GUARD-08 (M3): a job the host guard killed ends `killed` with the guard's reason, not `external_signal`; the
+/// guard learned about the job through its registration.
+#[tokio::test]
+async fn a_guard_kill_carries_the_guards_reason() {
+    let g = corral_worker::hostguard::FakeGuard::new();
+    let e = env_with(|_| Behavior::ExternalSignal { after_ms: 600 }, |a| a.with_guard(g.clone()));
+    let id = e.submit(&heavy(100));
+    e.until(&id, &[JobState::Running]).await;
+    e.worker.on_guard_event(&corral_worker::hostguard::GuardEvent {
+        kind: "kill".into(),
+        unit: Some(format!("corral:{id}:1")),
+        reason: "system_memory".into(),
+        detail: String::new(),
+    });
+    let j = e.until(&id, &[JobState::Killed]).await;
+    assert_eq!(j.reason.as_deref(), Some("system_memory"));
+    let reg = g.registered.lock().unwrap().clone();
+    assert_eq!((reg.len(), reg[0].name.clone(), reg[0].tier, reg[0].budget_mb), (1, format!("corral:{id}:1"), Some(0), Some(100)));
+    assert!(g.calls().iter().any(|c| c.starts_with("unregister")), "unregistered when the job ended");
+}
+
+/// R-ADM-03/04 (M3): a guard refusal never starts the job, counts no attempt, and its reason is what the job waits on.
+#[tokio::test]
+async fn a_guard_refusal_is_the_jobs_waiting_reason() {
+    let g = corral_worker::hostguard::FakeGuard::new();
+    *g.refuse.lock().unwrap() =
+        vec![corral_proto::api::DeclineReason { check: "screen_unlocked".into(), reason: "locked since 10:00".into() }];
+    let e = env_with(|_| Behavior::Exit { code: 0, after_ms: 10, stdout: String::new() }, |a| a.with_guard(g.clone()));
+    let id = e.submit(&heavy(100));
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let j = e.job(&id);
+    assert_eq!((j.state, j.attempts), (JobState::Queued, 0));
+    let text = j.waiting.iter().map(|w| w.text.clone()).collect::<Vec<_>>().join(" | ");
+    assert!(text.contains("screen_unlocked"), "{text}");
+    // the check passes later: the job runs
+    g.refuse.lock().unwrap().clear();
+    e.worker.claim_notify.notify_one();
+    e.until(&id, &[JobState::Succeeded]).await;
+}
+
+/// R-AWAKE-01 (M3): a hold named for the attempt, bound to its pid and sized by the timeout, released when it ends.
+#[tokio::test]
+async fn a_running_job_holds_the_host_awake_and_releases_it() {
+    use corral_worker::keepawake::{Call, FakeKeepAwake};
+    let ka = FakeKeepAwake::new();
+    let e = env_with(|_| Behavior::Exit { code: 0, after_ms: 300, stdout: String::new() }, |a| a.with_keepawake(ka.clone(), false));
+    let mut s = heavy(100);
+    s.timeout_s = 120;
+    let id = e.submit(&s);
+    e.until(&id, &[JobState::Succeeded]).await;
+    let calls = ka.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(
+        matches!(&calls[0], Call::Hold { owner, secs: 720, bound_pid: Some(_), display: false } if *owner == format!("corral:{id}:1")),
+        "{calls:?}"
+    );
+    assert_eq!(calls[1], Call::Release(format!("corral:{id}:1")));
 }

@@ -58,5 +58,6 @@ pub async fn start<R: Runtime>(
         }));
     }
     worker.spawn_loops();
+    worker.watch_guard();
     Ok(worker)
 }
