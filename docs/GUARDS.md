@@ -288,6 +288,10 @@ releases are signed with one stable identity (SPEC Q7).
 | tcc_input / tcc_capture | | | when caps include `tcc-input` / `tcc-capture` |
 | lock_free:<configured> | | ✓ | ✓ |
 
+**Light class (draft, round 2; SPEC R-ADM-08):** light work (class `light` jobs, light exec sessions, agent jobs'
+own admission) checks only `kill_switch_off` and `memory` (projection under the ceiling) plus a free light (or
+`agent`) slot, whatever the job's profile; it runs while the user is active and on battery.
+
 Custom profiles are lists of checks with parameters (SPEC.md §9). A legacy "dev" mode (skip idle and media) is the
 `default` profile plus `lock_free`.
 

@@ -96,6 +96,14 @@ Unit tests run with `cargo test` on macOS (aarch64) and Linux (x86_64) and must 
 | U-26 | Worker driven by `FakeRuntime`; native runtime reports tier 0 | R-RT-01, R-RT-02 |
 | U-27 | Legacy shim golden tests against recorded legacy outputs for every command and exit code | R-MIG-01 |
 | U-28 | Kill switch persisted in the state dir; a new guard instance on the same state refuses admission | R-GUARD-05 |
+| U-29 | (draft, round 2) Classifier golden corpus: segment splitting (`;`, `&&`, `\|\|`, `\|`, newline, `(`), backslash-newline, comments, skipped prefixes, `bash -lc`, heredoc and quoted text never matching, `cd` updating cwd, `ssh` payloads; each segment's class and rule | R-PLACE-01 |
+| U-30 | (draft) Decision combination table: all-local → local; any heavy/unknown → target; `local_only` + heavy → deny naming both; observe mode never rewrites | R-PLACE-02, R-PLACE-03 |
+| U-31 | (draft) Hook adapters: fixture pre-tool events → exact harness outputs for local, rewrite, deny, queue (exit 75 text), guarded local; secret-shaped commands logged by hash only | R-PLACE-03, PROTOCOL.md §14 |
+| U-32 | (draft) Escape marker and `corral local --reason` logged; `--propose` writes a diff and never edits the rules file; external profile selects a rule set | R-PLACE-05..07 |
+| U-33 | (draft) Exec sync manifest delta: edited, added, deleted, renamed files; deny-list; `dirty_foreign` detection against the last applied manifest | R-REXEC-03, R-REXEC-04 |
+| U-34 | (draft) Sync-back: patch of tracked + untracked-not-ignored changes; ignored paths only via `pull`; conflicting caller edit → patch kept, not applied | R-REXEC-05 |
+| U-35 | (draft) Light vs heavy admission with fakes: user active + battery → light admitted, heavy refused `ac_power` | R-ADM-08 |
+| U-36 | (draft) External token validation: valid DPoP-bound token; replayed `jti`; proof key ≠ `cnf.jkt`; wrong `htu`/`htm`; stale `iat`; wrong audience; expired; unknown issuer key | R-SEC-07 |
 
 ### 3.3 Lock conformance (LC)
 
@@ -148,6 +156,15 @@ test's process tree (§10, `sandbox_scope`), so a real kill can only reach proce
 | IT-28 | Progress events reach a follower | R-IO-06 |
 | IT-29 | Exit code in `pause_on_exit` pauses the worker; status shows reason | R-EXEC-06 |
 | IT-30 | Migration rollback dry run per phase (GUARDS.md §10.3) in a temp prefix: rollback command restores the legacy files and units | R-MIG-02 |
+| IT-31 | (draft, round 2) `corral exec` with the target worker offline → exit 75 within `exec_wait` + 1 s, reason names the worker; nothing queued | R-REXEC-01 |
+| IT-32 | (draft) 20 sequential `exec -- true` reuse one session; overhead p50/p95 recorded; idle timeout closes it and frees the slot | R-REXEC-02 |
+| IT-33 | (draft) Exec in `mirror` mode on a temp repo: dirty file and new untracked file visible; ignored canary `.env` absent; missing base commit fetched from a temp exchange remote; foreign change → `dirty_foreign`, file untouched | R-REXEC-03, R-REXEC-04, INV-7 |
+| IT-34 | (draft) Exec sync-back: lockfile patch applied; conflicting local edit → patch kept and reported; `--pull` of an ignored path | R-REXEC-05 |
+| IT-35 | (draft) Guard kill during an exec → exit 125 with the reason; not re-run | R-REXEC-06, INV-2 |
+| IT-36 | (draft) Agent job with a **fake runner** (script that edits a file and commits): worktree at `base_sha`, branch pushed to a temp exchange remote, `agent_result` fields; cancel calls the runner's stop and removes the worktree | R-AGENT-01, R-AGENT-02, R-AGENT-05 |
+| IT-37 | (draft) `agent` slot cap + 1 → one `queued` with `agent slots full`; deadline with `fallback = wait` → one notification; `fallback = local` → local start | R-AGENT-03, R-AGENT-04 |
+| IT-38 | (draft) Hook mode against a fake harness: rewrite produces an exec that returns the original exit code; target offline: heavy → queued job + exit 75, unknown → guarded local run killed at its timeout and logged | R-PLACE-03, R-PLACE-04 |
+| IT-39 | (draft) External issuer stub (temp JWKS): HTTP artifacts read with a DPoP-bound token; NATS connect through the auth callout with a token; each U-36 rejection case end to end | R-SEC-07 |
 
 ---
 
@@ -187,6 +204,9 @@ and between each client and the HTTP port, so network faults can be injected wit
 | E-12 | Identities: every CLI verb as `agent:*` and `owner`; priority > 80 and `lock = none` owner-only | forbidden where specified | R-SEC-02, R-SEC-03, R-QUEUE-08 |
 | E-13 | Notifications end to end through the `command` backend | one message per action, rate-limited per (kind, subject) | R-ADM-05, R-GUARD-08 |
 | E-14 | Full restart of all three hosts in sequence with jobs queued and running | no job lost without a `lost` record; no duplicate attempt | R-OPS-01, R-OPS-03 |
+| E-15 | (draft, round 2) Placement end to end: a scripted agent session on `server` with the hook in `observe` then `rewrite` mode runs a mixed command set; `laptop` online, then frozen (sleep) | observe changes nothing and logs every decision; rewrite runs heavy commands on `laptop` with exit codes preserved; with `laptop` asleep heavy commands are queued (exit 75) and run on wake; unknown commands run on `server` under guard | R-PLACE-*, R-REXEC-01 |
+| E-16 | (draft) Agent job from `server` to `laptop`, `laptop` frozen mid-run past `orphan_grace` | job `lost` → requeued per policy; the stale attempt's runner is killed on wake (`stale_lease`); never two agents on one branch | R-AGENT-*, R-QUEUE-05, R-QUEUE-06, INV-3 |
+| E-17 | (draft) Light vs heavy on `laptop` with a fake active user on battery: light exec and an agent job run; heavy exec waits with `ac_power` | as stated; INV-5 holds | R-ADM-08 |
 
 ---
 
@@ -589,6 +609,13 @@ severity of any failure, follow-up. Failures are reported before any cleanup tha
 | R-RT-02 | U-26 | | | |
 | R-MIG-01 | U-27 | | | CH-14 |
 | R-MIG-02 | | IT-30 | E-10 | |
+| R-ADM-08 (draft) | U-35 | | E-17 | |
+| R-SEC-07 (draft) | U-36 | IT-39 | | |
+| R-REXEC-01..02 (draft) | | IT-31, IT-32 | E-15 | |
+| R-REXEC-03..05 (draft) | U-33, U-34 | IT-33, IT-34 | | all (INV-7) |
+| R-REXEC-06 (draft) | | IT-35 | | |
+| R-AGENT-01..05 (draft) | | IT-36, IT-37 | E-16 | |
+| R-PLACE-01..07 (draft) | U-29..U-32 | IT-38 | E-15 | |
 
 Every requirement has at least one test. Requirements whose only coverage is a unit test with fakes (R-QUEUE-07,
 R-SEC-04, R-RT-*) are acceptable because they have no system-level behaviour to break.
@@ -632,6 +659,9 @@ R-SEC-04, R-RT-*) are acceptable because they have no system-level behaviour to 
 | M4 measurement/gui profiles, waits, notifications | U-10, U-12; E-07, E-08, E-09, E-13; CH-09, CH-10 |
 | M5 interactive leases | IT-20; E-05 |
 | M6 migration of ad-hoc work | E-02, E-03, E-11; CH-05, CH-06, CH-13, CH-16; full matrix green |
+| M7 (draft) exec + placement | U-29..U-35; IT-31..IT-35, IT-38; E-15, E-17 |
+| M8 (draft) agent jobs | IT-36, IT-37; E-16 |
+| Phase-2 auth (draft) | U-36, IT-39 |
 | G1 / G2 guard enforce per OS | CH-08 and CH-09 (Linux) or CH-08 and CH-15 (macOS) on that OS, plus the rollback dry run IT-30 |
 
 ---

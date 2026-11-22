@@ -5,6 +5,9 @@ there). Covers the NATS subjects and schemas between CLI, scheduler and workers,
 fencing, cancel, logs and progress, presence, interactive leases, and the HTTP API for bulk bytes. The local protocol
 between worker/CLI and the guard is in `docs/GUARDS.md` §6.
 
+Round 2 drafts (22-Nov-2026, not approved): agent jobs (§4.1), exec sessions (§11.1), external DPoP-bound tokens
+(§12.3), the local hook decision schema (§14).
+
 Notation: JSON shown with `//` comments for explanation only (the wire has no comments). Times are RFC 3339 UTC.
 Sizes are bytes unless the key ends in `_mb`. `<w>` = worker host name, `<id>` = job or lease id, `<who>` = caller
 identity slug.
@@ -117,6 +120,26 @@ Validation (reply `bad_request` with the field): heavy without `ram_mb`; `ram_mb
 `admissible_ram_cap` (warning field `unplaceable` instead of error if an offline worker might fit); unknown profile;
 `timeout_s` > `max_timeout` (config, default 48 h); `priority > 80` without `owner`.
 
+### 4.1 Agent jobs (draft, round 2; SPEC R-AGENT-*)
+
+An agent job is a job with `"kind": "agent"` (default kind is `"command"`) and an `agent` block; `cmd` is empty.
+
+```json
+{ "v": 1, "from": "agent:server", "req_id": "...", "authz": null, "kind": "agent",
+  "agent": { "repo_path": "/same/absolute/path/repo",   // same path on both hosts, or a remote URL
+             "base": "main", "base_sha": "<resolved>", "branch": "sub/fix-tests",
+             "provider": "example-provider", "model": "example-model",
+             "brief": {"kind": "inline", "text": "..."},     // or {"kind":"upload", "sha256":..., "bytes":...}
+             "fallback": "wait",                             // wait | local
+             "deadline_s": 7200, "keep_worktree": false },
+  "caps": ["macos"], "prefer": "laptop", "fallback_after_s": -1,
+  "ram_mb": 256, "class": "light", "timeout_s": 14400, "labels": {"parent_session": "..."} }
+```
+
+The worker admits it against its `agent` slot (presence `slots.agent_free`), creates the worktree from
+`exchange_remote` at `base_sha`, runs the configured runner, and on exit pushes `branch` to `exchange_remote`. It then
+sends the attempt event `agent_result` (§6.4) before `finished`.
+
 ## 5. Job state machine
 
 States: `uploading`, `queued`, `claimed`, `running`, `orphaned` (non-terminal); `succeeded`, `failed`, `killed`,
@@ -180,7 +203,7 @@ Request (`corral.work.<w>.claim`):
 { "v":1, "from":"worker:laptop", "req_id":"...", "authz":null,
   "version":"0.1.0", "runtime":"native", "cost_tier":0,
   "caps":["macos","arm64","metal","gpu","android"],
-  "slots":{"heavy_free":1,"light_free":2},
+  "slots":{"heavy_free":1,"light_free":2,"agent_free":4},
   "admission":{ "heavy_ok":true, "exclusive_ok":false, "profiles_ok":["default","gui"],
                 "admissible_ram_mb":5200,
                 "blocked":[{"check":"user_idle","profile":"measurement","reason":"idle 40s (need 300s)",
@@ -228,6 +251,8 @@ On `stale_lease` the worker kills the attempt's process group, discards unsent l
 | `finished` | `{"outcome":"exited|killed|lost_local", "exit_code":3, "signal":null, "reason":null|<kill reason>, "detail":"...", "footprint_peak_mb":8100, "duration_s":312, "disturbed":false, "log_dropped_bytes":0}` |
 | `artifacts` | `{"state":"uploaded|refused|none", "bytes":123, "sha256":"..."}` |
 | `note` | `{"text":"SIGSTOP: free 21% pressure 2"}` (also written to the `sys` log stream) |
+| `agent_result` (draft) | `{"branch":"sub/fix-tests", "head_sha":"...", "pushed":true, "summary":"... (≤ 4 KiB)", "diffstat":{"files":3,"insertions":40,"deletions":7}, "runner_exit":0}` |
+| `sync_back` (draft, exec steps) | `{"patch_sha256":"...", "bytes":1234, "files":["package-lock.json"], "pulled":["build/report.html"], "dropped":[]}` |
 
 `disturbed: true` marks an exclusive job during which real user input occurred (`on_user_input: continue`).
 
@@ -339,6 +364,24 @@ directory; **steps** are jobs with `parent = <lease id>` that run in it, one at 
 - Idle timeout or `close` releases everything and removes the directory (`keep_dir_s` keeps it up to 24 h).
 - Limits: `ttl_s` ≤ 8 h, `idle_s` default 20 min (Q10).
 
+### 11.1 Exec sessions (draft, round 2; SPEC R-REXEC-*)
+
+`corral exec` uses a lease of `"kind": "exec"`; the subjects are the lease subjects above.
+
+| Field (`lease.open`) | Meaning |
+|---|---|
+| `"kind": "exec"` | no queueing: if no worker admits within `wait_s` (default 10), the scheduler replies `{"error":"unavailable", "waiting":[...]}` and drops the request |
+| `"workdir": "mirror" \| "scratch"` | `mirror`: run at `"path"` (the caller's absolute repository root) if the worker allows that root; `scratch`: worker-managed dir |
+| `"path"`, `"base_sha"`, `"exchange_remote"` | repository root, base commit, remote to fetch the base from when missing |
+| `"class": "light" \| "heavy"` | admission class (SPEC R-ADM-08) |
+
+`lease.exec` adds `"sync_back": true` (default) and `"pull": [paths]`. Before each step the worker checks the mirror
+checkout: files differing from `base_sha` that are not in the session's last applied manifest → step declined with
+`{"check":"dirty_foreign", "reason":"...", "files":[...]}`, nothing written. After the step the worker computes the
+patch of changed tracked and untracked-not-ignored files, uploads it with the pulled paths as the step's artifacts,
+and sends `sync_back` (§6.4). The client applies the patch only if `git apply --check` passes on its tree.
+The session is closed by `lease.close`, by `idle_s`, or when the caller's connection has been gone for `idle_s`.
+
 ## 12. Authentication and authorization
 
 ### 12.1 v1: nkeys and per-subject permissions
@@ -377,7 +420,16 @@ Capability tokens (§10). Phase 2 adds externally issued JWTs.
    `{"error":"grant_required", "action":"corral:exclusive", "binding_message":"..."}`; the CLI runs the issuer's
    approval flow and retries with `authz` set. Proof-of-possession (DPoP) for NATS requests travels in a
    `Corral-DPoP` header, defined now and ignored in v1.
-4. **Labels for data segregation:** `labels.level` on jobs map to resource URIs (`corral://jobs/<id>`) for scoped
+4. **External DPoP-bound tokens (draft, round 2; SPEC R-SEC-07).** With `auth.external` configured:
+   - HTTP: `Authorization: DPoP <access token>` plus a `DPoP` proof header (RFC 9449); the scheduler validates the
+     token against the issuer's JWKS (issuer, audience, expiry), the proof (`htm`, `htu`, `iat` within 60 s, `jti`
+     not seen in the last 5 min) and that the proof key's thumbprint equals the token's `cnf.jkt`. Scope maps to
+     `{job, verb}` as for capability tokens.
+   - NATS: the auth callout receives the token and a proof in the connect options; corral defines the proof's
+     `htm = "CONNECT"`, `htu = "nats://<server>/corral"` [unverified as a standard profile; SPEC Q19]. The issued user
+     JWT carries the §12.1 permission template for the token subject's slug.
+   - The issuer is any OIDC provider; approval grants (CIBA) still arrive in `authz`.
+5. **Labels for data segregation:** `labels.level` on jobs map to resource URIs (`corral://jobs/<id>`) for scoped
    read grants later.
 
 ## 13. Compatibility notes
@@ -385,3 +437,23 @@ Capability tokens (§10). Phase 2 adds externally issued JWTs.
 - A v1 worker talking to a scheduler that answers `version_unsupported` stops claiming, keeps running attempts to
   completion, and reports the skew in presence.
 - The CLI prints a one-line warning when its minor version differs from the scheduler's.
+
+## 14. Local hook decision (draft, round 2; SPEC R-PLACE-*)
+
+`corral classify --json` and `corral hook <harness>` share one decision record, also written to the decision log
+(JSON lines):
+
+```json
+{ "v": 1, "t": "...", "cwd": "/abs/path", "mode": "observe|rewrite|deny",
+  "decision": "local|rewrite|deny|queue|guarded_local|escape",
+  "target": "laptop", "target_online": true,
+  "segments": [ {"text": "cd repo", "class": "local_ok", "rule": "cd"},
+                {"text": "npm test", "class": "heavy", "rule": "test.npm"} ],
+  "reason": "heavy segment 'npm test' (rule test.npm); laptop online",
+  "rewritten": "corral exec --on laptop --cwd /abs/path --class heavy -- cd repo && npm test",
+  "job": null, "command_sha256": "...", "profile": "build-heavy" }
+```
+
+The harness adapters translate it: a rewrite becomes the harness's input-update output, a deny its deny output with
+`reason`, `local` and `observe` produce no change. The log never stores the command text when it matches the secret
+deny-list; `command_sha256` is kept instead.

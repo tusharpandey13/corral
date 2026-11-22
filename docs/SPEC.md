@@ -20,6 +20,9 @@ Owner decisions this spec rests on (22-Nov-2026):
 
 Unverified external facts are marked **[unverified]**.
 
+Round 2 (22-Nov-2026, draft): agent work placement (G11): remote exec (§4.14), agent jobs (§4.15), classifier and
+hook mode (§4.16), light/heavy admission classes (R-ADM-08), external DPoP-bound tokens (R-SEC-07). Not approved.
+
 ---
 
 ## 1. Overview
@@ -64,6 +67,10 @@ Goals:
   cluster consensus.
 - **G10. Interactive leases.** A session on one host can hold a slot on another and run successive commands in a
   persistent, synced work directory.
+- **G11. Agent work placement** (draft, 22-Nov-2026 round 2). An agent session that lives on an always-on but weak
+  host can send its file-heavy commands to a stronger host transparently: a command classifier, a pre-tool hook mode
+  that rewrites commands to `corral exec`, quick remote exec with dirty-tree sync, and agent jobs that run a whole
+  sub-agent on another host and return a branch and a summary.
 
 Non-goals:
 - **N1.** Not Kubernetes, Nomad or Slurm. Target: 1 to 10 machines owned by one person.
@@ -88,7 +95,11 @@ Non-goals:
 | attempt token | Random 128-bit fencing token per attempt (`lease_token`). The scheduler rejects heartbeats, logs and events carrying a stale one. |
 | worker | A `corral worker` process; offers caps and slots; pulls work. |
 | caps | Capability tags a worker offers and a job requires (`macos`, `linux`, `arm64`, `x86_64`, `metal`, `gpu`, `android`, `tcc-input`, `tcc-capture`, ...). Free-form strings; matching is set inclusion. |
-| class | `heavy` (default) or `light` (declared RAM ≤ 1 GiB, not exclusive). Heavy jobs consume a heavy slot. |
+| class | `heavy` (default) or `light` (declared RAM ≤ 1 GiB, not exclusive). Heavy jobs consume a heavy slot. Light work is admitted while the host's user is active; heavy work needs the full profile (R-ADM-08). |
+| exec session | A short-lived interactive lease of kind `exec` used by `corral exec`: no queueing, a work directory at the **same absolute path** as on the submitting host (`mirror`) or a scratch dir, dirty-tree sync before each command (§4.14). |
+| agent job | A job of kind `agent`: starts a coding agent on the worker's host in its own git worktree and branch, returns branch, head and summary (§4.15). |
+| classifier | `corral classify`: splits a shell command into segments and assigns each a placement class (`local_only`, `local_ok`, `heavy`, `unknown`) from configured rules (§4.16). |
+| hook mode | Running the classifier as an agent harness pre-tool hook that lets a command run locally, rewrites it to `corral exec`, denies it with a reason, or queues it (§4.16). |
 | exclusive | A benchmark-grade job: needs an idle user and no competing GPU/emulator/game work; runs without background QoS. |
 | guard (daemon) | `corral guard`: the one per-host process that protects the host. |
 | check | One admission test (memory, idle, AC, lock, TCC, ...) returning `{ok, reason, value, since}`. |
@@ -175,6 +186,11 @@ behaviour lives in the companion documents named per group.
   notification per (job, reason). **AC:** fake clock + fake notifier: one call.
 - **R-ADM-06** `corral admit` is usable by non-corral tools: exit 0 = admitted (with an optional reservation), 1 =
   refused with a one-line reason, 2 = usage, 5 = guard unreachable. **AC:** CLI tests for each code.
+- **R-ADM-08** (draft, round 2) **Light and heavy admission classes.** Light work (class `light`, exec sessions of
+  class light) needs only `kill_switch_off`, the memory projection under the host's ceiling and a free light slot;
+  it runs while the host's user is active and on battery. Heavy work needs the job's full profile (`default`:
+  memory, heavy slot, AC power on laptops, thermal, disk; `measurement` adds the idle stages). **AC:** with a fake
+  active user on battery: a light exec is admitted; a heavy exec is refused with `ac_power`.
 - **R-ADM-07** Two-stage idle for `measurement`: stage 1 (≥ 300 s) gates the claim; stage 2 (≥ 120 s) is re-checked
   under the lock before each run; the host's own synthetic input does not reset idle. **AC:** fake idle tracker
   tests including a synthetic-input stamp.
@@ -285,6 +301,13 @@ behaviour lives in the companion documents named per group.
   same schema.
 - **R-SEC-05** HTTP requests carry a capability token scoped to one job, one verb, and an expiry. **AC:** a token for
   job A cannot read job B; expired token → 401.
+- **R-SEC-07** (draft, round 2) **External tokens at the auth plug-in point.** When `auth.external` is configured, the
+  scheduler (HTTP) and the NATS auth callout accept access tokens from a configured OIDC issuer (issuer URL, audience,
+  JWKS), including **DPoP-bound** tokens (RFC 9449: the `cnf.jkt` thumbprint must match a valid DPoP proof). The
+  token's subject maps to an identity slug and the same permission templates as nkey identities; approval grants
+  (CIBA) arrive in `authz` as before. nkeys keep working (`auth_users` bypass). **AC:** a valid token with a matching
+  DPoP proof is accepted; a replayed proof (same `jti`), a proof signed by another key, a wrong audience and an expired
+  token are each rejected with `forbidden`.
 - **R-SEC-06** NATS and HTTP listen only on configured addresses (default loopback + the private overlay address).
   **AC:** config validation rejects `0.0.0.0` unless `allow_public_bind = true`.
 
@@ -311,6 +334,76 @@ behaviour lives in the companion documents named per group.
   shape (`ok` / `refused: ...`) and exit codes. **AC:** golden tests of the shim against recorded legacy outputs.
 - **R-MIG-02** Every migration step has a documented one-command rollback that restores the legacy behaviour.
   **AC:** rollback dry run in the migration test checklist.
+
+### 4.14 Remote exec (draft, round 2; PROTOCOL.md §11.1)
+
+- **R-REXEC-01** `corral exec --on W -- CMD` runs one command on worker W **without queueing**: if W does not admit it
+  within `exec_wait` (default 10 s) the CLI exits 75 with the waiting reason; it never falls back to running locally.
+  **AC:** W offline → exit 75 within `exec_wait` + 1 s and the reason names W.
+- **R-REXEC-02** The CLI keeps one exec session per (caller session, repository root) open while used (`idle` default
+  20 min) over a persistent connection; a command's overhead without file changes is ≤ 300 ms on a LAN-class overlay
+  [target, to be measured]. **AC:** 20 sequential `exec -- true` calls reuse one session; p50 overhead recorded.
+- **R-REXEC-03** **Dirty-tree sync:** before each command the CLI sends the delta of tracked plus
+  untracked-not-ignored files against the session's last manifest (deny-list of R-IO-02 applies); a missing base
+  commit is fetched by the worker from a configured git remote. **AC:** an edited tracked file and a new untracked
+  file are visible remotely; an ignored `.env` is not sent.
+- **R-REXEC-04** **Same-path mode** (`workdir = "mirror"`, allowed roots configured on the worker): the command runs
+  at the same absolute path as on the caller. The worker refuses with `dirty_foreign` when that checkout has changes
+  not written by an earlier sync of an exec session, naming the files; it never overwrites them. `workdir = "scratch"`
+  uses a worker-managed directory instead. **AC:** foreign change present → refusal names it; file unchanged.
+- **R-REXEC-05** **Outputs back:** stdout/stderr stream live and the CLI exits with the command's code (125 when
+  killed or lost); changes the command made to tracked or untracked-not-ignored files return as a patch applied on the
+  caller only if it applies cleanly (else saved and reported); ignored paths return only with `--pull PATH`, capped.
+  **AC:** lockfile change applied; conflicting local edit → patch kept as a file and reported; `--pull` path present.
+- **R-REXEC-06** An exec is an attempt like any other: guard kills are final, a lost exec never re-runs on its own,
+  and every exec appears in `corral status`. **AC:** guard kill during exec → exit 125 with the reason; no re-run.
+
+### 4.15 Agent jobs (draft, round 2; PROTOCOL.md §4.1)
+
+- **R-AGENT-01** `corral agent submit --on W --repo PATH --base REF --branch NAME --brief FILE [--provider P]
+  [--model M] [--deadline D] [--fallback wait|local]` creates a job of kind `agent`. The worker creates a git worktree
+  of the repository at the base ref (fetched from the configured exchange remote) and starts the agent through the
+  configured **agent runner** (a command template that talks to a local agent daemon or CLI). **AC:** with a fake
+  runner, the worktree exists at the base sha and the runner received the brief.
+- **R-AGENT-02** On completion the worker commits nothing itself, pushes the agent's branch to the exchange remote and
+  reports `agent_result`: branch, head sha, summary (capped 4 KiB), diffstat, runner exit status. Transcripts stay on
+  the worker's host. **AC:** result fields present; branch fetchable by the submitter.
+- **R-AGENT-03** Agent jobs use a named slot `agent` (default 4 per host) and are admitted as light work plus a
+  per-agent memory reservation (`agent_ram`, default 256 MiB); commands the agent runs take heavy slots under normal
+  admission. **AC:** cap + 1 submits → one `queued` with `agent slots full`.
+- **R-AGENT-04** Waiting is explained like any job; at `deadline`, `fallback = wait` notifies and keeps waiting,
+  `fallback = local` runs the agent on the submitter's host. **AC:** fake clock past deadline → one notification, or a
+  local start.
+- **R-AGENT-05** Cancel stops the agent through the runner, then the process group; the worktree is removed unless
+  `--keep`. **AC:** cancel mid-run → runner stop called; job `cancelled`.
+
+### 4.16 Command placement: classifier and hook mode (draft, round 2)
+
+- **R-PLACE-01** `corral classify [--cwd DIR] [--json] -- STRING` splits a shell command into segments (on `;`, `&&`,
+  `||`, `|`, newlines and `(`; backslash-newline joins; unquoted `#` comments dropped; leading `VAR=x`, `sudo`, `env`,
+  `command`, `time`, `nohup` skipped; `bash|sh|zsh -c STR` parsed; heredoc bodies and quoted text never match; `cd DIR`
+  updates the effective cwd of later segments; `ssh HOST CMD` payloads classified too) and assigns each segment a class
+  from configured rules: `local_only`, `local_ok`, `heavy`, `unknown`. **AC:** golden corpus test including `cd x &&
+  npm test | tail` (heavy), a heredoc mentioning a test runner (not heavy), `bash -lc "cargo build"` (heavy).
+- **R-PLACE-02** Combination: the command stays local only if every segment is `local_ok` or `local_only`; a command
+  mixing `local_only` with `heavy`/`unknown` segments is denied with a reason naming both (it cannot be split).
+  **AC:** table test.
+- **R-PLACE-03** **Hook mode** (`corral hook <harness>`): reads the harness's pre-tool event, classifies, and answers
+  in the harness's format: run locally; **rewrite** the command to `corral exec --on W ...` (recommended mode);
+  **deny** with a reason (alternative mode); or, when W is offline, **queue** heavy commands as a job and return at once
+  with exit 75 and the reason, and run `unknown` commands locally under guard (`corral local --guard`: timeout,
+  low CPU/IO weight, memory cap). Every decision is logged. An `observe` mode logs the decision and changes nothing.
+  **AC:** for each decision a fixture event produces the expected harness output; observe mode never changes input.
+- **R-PLACE-04** Presence for hook decisions is read from a local cache (`corral workers --watch`), so a decision
+  makes no network call; p95 decision time < 50 ms. **AC:** benchmark over the golden corpus.
+- **R-PLACE-05** Escape hatch: a configured marker comment (default `# @local`) or `corral local --reason TEXT -- CMD`
+  runs locally (guard limits without the timeout) and is logged with the reason. **AC:** marker honoured and logged.
+- **R-PLACE-06** The rules file is data; corral never edits it. `corral classify --propose` reads the decision log and
+  writes a proposal diff (patterns that ran locally under guard, fast and small); applying it is the owner's act.
+  **AC:** proposal written; rules file unchanged.
+- **R-PLACE-07** A per-project profile (`light`, `build-heavy`, `media-device`) may be supplied by an external
+  provider (a file or command) and selects rule sets; corral does not store profiles. **AC:** profile switches a rule
+  set in a fixture.
 
 ## 5. Architecture
 
@@ -466,12 +559,18 @@ corral run [--name N] [--ram 4G] [--profile P] [--lock NAME] [--tier N] [--hold]
 corral lock acquire|renew|release|status|wait|exec NAME ...                     # GUARDS.md §5
 corral guard watch|stop|resume|status [--json]|explain                          # GUARDS.md §3
 corral admin pause|resume [--worker W] | drain W | kill-switch on|off            # owner only
+corral exec --on W [--cwd DIR] [--class light|heavy] [--pull PATH]... [--no-sync] -- CMD...   # §4.14, no queue
+corral agent submit|status|wait|cancel ...   # §4.15 agent jobs
+corral classify [--cwd DIR] [--json] [--propose] -- STRING                       # §4.16
+corral hook claude-pretooluse|plugin-permission [--mode observe|rewrite|deny]   # §4.16, reads the event on stdin
+corral local [--guard] [--reason TEXT] -- CMD...                                 # run here, guarded and logged
 corral scheduler | corral worker             # daemons
 corral config check [FILE]
 ```
 
 Exit codes (stable, R-OPS): `0` ok; job's own code for `wait`; `1` refused (admit, lock busy); `2` usage; `3` not
-found; `4` auth denied; `5` scheduler or guard unreachable; `125` job ended killed/lost/cancelled/expired. `submit`
+found; `4` auth denied; `5` scheduler or guard unreachable; `75` not admitted now / queued for later (`exec`, hook queue
+decisions; the reason is printed); `125` job ended killed/lost/cancelled/expired. `submit`
 never falls back to running locally.
 
 ## 9. Configuration
@@ -514,6 +613,30 @@ ceiling_used_pct = 80                  # never let corral-caused load pass this
 admit_floor_free_pct = 23              # projection floor for admission
 notify = { backend = "ntfy", topic_file = "/run/secrets/corral-ntfy" }
 # levels, matchers, protected sets, restore hooks, locks, keep-awake: see GUARDS.md §9
+
+[exec]                                 # worker side (draft, round 2)
+workdir = "mirror"                     # mirror | scratch
+mirror_roots = ["$HOME/src"]          # same-path mode only below these roots
+exec_wait = "10s"
+idle = "20m"
+
+[agents]                               # worker side (draft, round 2)
+slots = 4
+agent_ram = "256M"
+runner = ["agent-runner", "--cwd", "{worktree}", "--brief", "{brief}", "--provider", "{provider}", "--model", "{model}"]
+exchange_remote = "hub"                # git remote used for base refs and result branches
+
+[placement]                            # caller side, hook mode (draft, round 2)
+mode = "observe"                       # observe | rewrite | deny
+target = "laptop"
+rules = "$XDG_CONFIG_HOME/corral/placement.toml"
+local_guard = { timeout = "30s", cpu_weight = 20, io_weight = 20, memory_max = "1G" }
+escape_marker = "# @local"
+
+[auth.external]                        # optional, phase 2 plug-in point (R-SEC-07)
+issuer = "https://issuer.example.ts.net"
+audience = "corral"
+require_dpop = true
 
 [profiles.measurement]
 checks = ["kill_switch_off", "memory", "thermal_ok", "disk_free", "ac_power", "no_lpm", "screen_unlocked",
@@ -604,8 +727,11 @@ Nothing in the goals is dropped; items are sequenced. "Phase 2" means after v1 i
 | Thermal cooldown before the next exclusive job | ✓ | | legacy queue behaviour |
 | `pause_on_exit` codes | ✓ | | legacy queue behaviour |
 | Interactive leases, one-way sync + pulls | ✓ (last v1 milestone) | two-way sync | no current loop needs two-way |
+| `corral exec` (no-queue exec sessions, same-path mode, sync-back patch) | draft, after M5 (M7) | | G11; reuses lease sync |
+| Classifier + hook mode (observe, rewrite, deny, queue, guarded local) | draft (M7) | | G11 |
+| Agent jobs (worktree, runner, exchange remote, `agent` slot) | draft (M8) | | G11 |
 | nkey identities, per-subject permissions, capability tokens, `authz` field, policy table (empty) | ✓ | | G8 |
-| External authorization: NATS auth callout, HTTP JWTs, CIBA approvals, DPoP | schema only | ✓ | issuer not built yet |
+| External authorization: NATS auth callout, HTTP JWTs, CIBA approvals, DPoP-bound OIDC tokens (R-SEC-07) | schema + config key | ✓ | issuer not built yet |
 | Runtime trait + native runtime | ✓ | | R-RT |
 | Cloud runtimes (Modal Sandbox, rented VM over SSH, SkyPilot, lease-a-Mac), cost tiers, budget ledger | interface + tier field | ✓ | owner decision 4 |
 | Host pre/post-run hooks (e.g. dim display before a measurement) | | ✓ | domain-specific; tools can use `corral run` meanwhile |
@@ -623,6 +749,8 @@ Rollout (each step has exit criteria in the test rubric, still owed):
 4. **M4** `measurement` and `gui` profiles, waiting explanations, notifications, legacy-queue interop checks.
 5. **M5** interactive leases.
 6. **M6** migrate ad-hoc heavy work to `corral submit` / `corral run`; retire legacy watch loops.
+7. **M7** (draft) `corral exec`, classifier, hook mode in `observe`, then `rewrite`.
+8. **M8** (draft) agent jobs.
 7. **Phase 2:** external authorization; cloud runtimes.
 
 Tests: unit tests with fake probes, clock and runtime; lock conformance against the reference implementation;
@@ -701,3 +829,17 @@ working tree; keep-awake holds; a queue that tolerates workers offline for days.
 - **Q13. Phase-2 budget model:** monthly cap per owner vs per-job cap only (RUNTIMES.md §4).
 - **Q14. IO-heavy concurrency cap:** is an `io_heavy` flag plus `io_slots` (R-SCHED-05a) the right shape, or should it be a
   generic named-resource slot (`slots = { heavy = 1, light = 2, io = 1 }`)? Proposed: generic named slots.
+- **Q15. Exec workdir default** (R-REXEC-04): same-path `mirror` (commands with absolute paths work; refuses on
+  foreign changes) vs `scratch` (never touches the worker user's checkout). Proposed: `mirror` where roots are
+  configured, else `scratch`.
+- **Q16. Hook decision when the target is offline and the command is `unknown`:** run locally under guard (proposed)
+  vs queue like heavy.
+- **Q17. Harness rewrite semantics** [unverified]: whether a pre-tool hook's input rewrite must be paired with an
+  "allow" decision (bypassing the harness's own permission rules) and how several rewriting hooks combine. Proposed:
+  one hook entry point that can chain other rewriters, until verified.
+- **Q18. Agent runner contract:** command template (proposed) vs a runtime adapter of its own.
+- **Q19. DPoP over NATS** [unverified as a standard profile]: DPoP proofs bind an HTTP method and URL; for the NATS
+  auth callout corral would define `htm = "CONNECT"`, `htu = "nats://<server>/corral"`. Proposed: HTTP DPoP per RFC
+  9449 in phase 2 first, NATS profile after review.
+- **Q20. Exec class default:** classify from the classifier's segment classes (`heavy` → heavy) (proposed) or always
+  light unless `--class heavy`.
