@@ -112,6 +112,10 @@ Unit tests run with `cargo test` on macOS (aarch64) and Linux (x86_64) and must 
 | U-JP-05 | (draft) Proposal redaction: canaries in argv, env, URLs, heredocs and high-entropy names never appear; below `--min-sessions` nothing proposed; file mode 0600 | R-JPROF-12 |
 | U-JP-06 | (draft) Approval levels: defaults; `approve` or unsafe admin below 2 refused by config check; level 0 needs no grant; safe vs unsafe admin direction mapped correctly | R-JPROF-18 |
 | U-JP-07 | (draft) Cargo import/publish logic over a fake pool: import only lockfile crates with a matching hash of the private copy; publish only hashes listed in the lockfile; non-crates.io and git sources ignored | R-JPROF-20 |
+| U-JP-08 | (draft, 23-Nov) Prefixes: 1-4 accepted; five, mixed first tokens, duplicates and prefix-of-another refused; four prefixes round-trip under 4 KiB; the matched prefix index is recorded; `cargo fmt && cargo clippy && cargo test` over one profile is accepted | R-JPROF-02, R-JPROF-03, R-JPROF-23 |
+| U-JP-09 | (draft, 23-Nov) Tool pins: grammar, uniqueness, sort order, `exe` coverage, `was` handling, rendering with and without a version change; manifest hashing | R-JPROF-22 |
+| U-JP-10 | (draft, 23-Nov) Compound-command rule: one case per reason code and per allowed glue form; the `mixed_light` split message golden (two-call split, `&&` marked conditional, `cd` carried into each call); an unmatched heavy step refuses the call whatever else it holds; wrapper unwrapping; `unparseable` with a heavy program word; observe mode logs `split_refused` | R-JPROF-23, R-PLACE-01, R-PLACE-02 |
+| U-JP-11 | (draft, 23-Nov) `network` allowlist in a profile is representable and rendered but refused by the installer check `network_allow_unsupported`; `fallback = local` for an agent job to a `required` worker is `bad_request` | R-JPROF-02, R-JPROF-06, R-AGENT-04 |
 
 ### 3.3 Lock conformance (LC)
 
@@ -185,6 +189,9 @@ test's process tree (§10, `sandbox_scope`), so a real kill can only reach proce
 | IT-JP-10 | (draft) Shared cache, cargo and pip with a local registry stub: import and publish by lockfile hash; pip installs only with hashes | R-JPROF-20 |
 | IT-JP-11 | (draft) Cache GC: over-limit store shrinks to ≤ 80%; corrupt entry deleted and reported with the owning profile; entries younger than 10 min kept; publish refused under the free-space floor | R-JPROF-21 |
 | IT-JP-12 | (draft) Scheduler least privilege: static check of no process spawn; config check warns on readable credentials | R-JPROF-15 |
+| IT-JP-13 | (draft, 23-Nov) Pinned tools with a fake installer and fake tool dirs: install; refuse a path in a home, writable by the runner, wrong hash, uncovered `exe`, wrong `was`; alter a pinned file between instances → `tool_changed` with the refresh hint and one notification per day; same size and mtime but changed content is caught through `ctime`; `profiles refresh` builds rev + 1 and the old rev keeps running (or refusing) until approval; a repository toolchain file does not change the executed version; daily verify emits `tool_corrupt` | R-JPROF-22, R-JPROF-21 |
+| IT-JP-14 | (draft, 23-Nov) Hydrate fallback: offline miss → one fetch instance as the fetch profile's runner with scripts off → offline retry succeeds; the requesting instance cannot open a connection; a fetch profile that is expired, busy past the lease or failing → `deps_missing` naming the fetch job; an invalid `fallback` is refused at request and by the installer | R-JPROF-20 |
+| IT-JP-15 | (draft, 23-Nov) Box worker: an undeclared job, including an agent-submitted one, is `box_job_not_declared`; a declared service job runs; `--fallback local` for agent jobs is `bad_request`; large-repository `git log -p` and `rg` run in the light envelope | R-JPROF-13, R-AGENT-04 |
 
 ### 4.1 Security suite for job profiles (SEC-JP, draft, round 3)
 
@@ -212,6 +219,11 @@ Run on a real host with real runner users (macOS and Linux), in the sandbox of �
 | SEC-JP-18 | **Cache poisoning, pip:** a member replaces a cached wheel body | the consumer's hash-checking install fails; nothing installed | R-JPROF-20 |
 | SEC-JP-19 | caller tries to redirect or unverify a store (env, workspace `.npmrc`, user config file) | env refused; `.npmrc` refused `cache_config_override`; config ignored | R-JPROF-20 |
 | SEC-JP-20 | a runner outside the group, and a member of another group, read the store | EACCES | R-JPROF-19 |
+| SEC-JP-21 | a repository `rust-toolchain.toml`, `.nvmrc` or version-manager shim tries to select another tool version | the pinned `exe` runs; the notice line is printed | R-JPROF-22 |
+| SEC-JP-22 | the runner tries to replace or edit a pinned tool file or directory, or `PATH` is set by the caller | EACCES; caller `PATH` and toolchain variables refused | R-JPROF-22, R-JPROF-03 |
+| SEC-JP-23 | a tool swapped after install with its size and mtime restored | detected (`ctime` or re-hash); instance refused `tool_changed` | R-JPROF-22 |
+| SEC-JP-24 | the requesting profile's instance tries the network during hydrate fallback; the fetch step runs an install script from the repository | the instance has no network; install scripts do not run | R-JPROF-20 |
+| SEC-JP-25 | wrappers and glue that smuggle a heavy step: `xargs`, `find -exec`, `eval`, `$( )`, a loop, `&`, a heredoc on stdin, a non-allowed `VAR=`, `export`, `cd $D` | the whole call is refused with the matching code; nothing runs | R-JPROF-23 |
 
 ---
 

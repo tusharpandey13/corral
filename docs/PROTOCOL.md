@@ -157,7 +157,12 @@ A job, exec step, lease step or agent job sent to a worker with `job_profiles = 
 - Decline checks: `job_profile` (no profile named on a `required` worker), `profile_not_installed` (unknown id, rev or
   digest), `profile_digest_mismatch` (the launcher's installed copy differs), `profile_expired` (`valid_until`
   passed), `deps_missing` (hydrate could not install from the shared cache; exit 75 with a hint),
-  `cache_config_override` (a workspace file would redirect a shared store).
+  `cache_config_override` (a workspace file would redirect a shared store), `tool_changed` (a pinned tool is missing or its
+  hash or stamp differs from the pin; the reason names the tool, the pinned version and the refresh command; R-JPROF-22).
+  Events: `tool_corrupt` (daily verify found a changed pinned file; new instances of the profiles that pin it are refused),
+  `hydrate_miss` (offline hydrate missed packages; the worker submits the fetch profile instance, R-JPROF-20).
+  Installer refusals add `network_allow_unsupported` (R-JPROF-06). A box worker refuses an undeclared job with
+  `box_job_not_declared` (R-JPROF-13).
 
 Profile verbs (client → scheduler, `corral.api.<who>.profiles.*`): `request {detail}` (starts the approval; returns
 the approval request id), `list`, `show {id, render: bool}`, `disable {id}` (never gated). Scheduler → worker control
@@ -351,7 +356,7 @@ published as events with `state` unchanged.
 ```
 
 Round 3 (SPEC §4.17): a worker with `job_profiles = "required"` adds
-`"job_profiles": [{"id": "npm-test", "rev": 2, "digest": "sha256:...", "prefix": ["npm", "test"], "max_lease_s": 1800,
+`"job_profiles": [{"id": "npm-test", "rev": 2, "digest": "sha256:...", "prefixes": [["npm", "test"], ["npm", "run", "lint"]], "max_lease_s": 1800,
 "valid_until": "..."}]`, which the hook's local cache reads (R-PLACE-04).
 
 A key not refreshed for 60 s expires; watchers see the purge and show `offline since <t>`.
@@ -530,4 +535,7 @@ Round 3 (SPEC R-JPROF-13): with `placement.job_profiles = "required"`, `decision
 `unknown` segment in the light envelope) and `refused`; `guarded_local` is no longer produced for heavy segments.
 A refusal records `"profile_miss": {"shape": "cargo bench", "weight": 3, "repo_key": "name", "target_online": true}`
 (shape built by the R-JPROF-12 rules; never the command text) and the deny `reason` names the shape and how to request
-a profile. A rewrite names the profile: `corral exec --on laptop --profile npm-test --cwd sub --lease 900 -- npm test`.
+a profile. With the compound-command rule (R-JPROF-23) a refusal's `reason_code` is one of `heavy_unmatched`, `mixed_light`,
+`heavy_in_substitution`, `heavy_in_control`, `heavy_stdin`, `heavy_background`, `heavy_wrapped`, `env_not_allowed`,
+`cwd_unresolved`, `unparseable`; in observe mode the same codes are logged as `split_refused` entries (code and shapes
+only). A rewrite names the profile: `corral exec --on laptop --profile npm-test --cwd sub --lease 900 -- npm test`.
